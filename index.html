@@ -186,6 +186,176 @@ input:focus,select:focus,textarea:focus{border-color:var(--P);box-shadow:0 0 0 3
 .bg-pink{background:linear-gradient(135deg,#e84393,#b5116a)}
 .bg-indigo{background:linear-gradient(135deg,#3949ab,#1a237e)}
 .bg-gold{background:linear-gradient(135deg,#c8a84b,#a07820)}
+
+/* ====== POWERFUL LOCK BUTTON ====== */
+.exam-lock-btn-locked {
+  background: linear-gradient(135deg,#ff0000,#8b0000) !important;
+  color: #fff !important;
+  border: 2.5px solid #ff4444 !important;
+  box-shadow: 0 0 20px rgba(255,0,0,.6), 0 0 40px rgba(255,0,0,.3), inset 0 1px 0 rgba(255,255,255,.2) !important;
+  font-size: 14px !important;
+  letter-spacing: .5px;
+  text-shadow: 0 1px 3px rgba(0,0,0,.5);
+  animation: lockPulse 2s infinite;
+  position: relative;
+  overflow: visible !important;
+}
+.exam-lock-btn-locked::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 14px;
+  background: linear-gradient(135deg,#ff0000,#ff6600,#ff0000);
+  background-size: 200% 200%;
+  animation: borderAnim 2s linear infinite;
+  z-index: -1;
+  opacity: .7;
+}
+.exam-lock-btn-open {
+  background: linear-gradient(135deg,#00c853,#007a2f) !important;
+  color: #fff !important;
+  border: 2.5px solid #00e676 !important;
+  box-shadow: 0 0 20px rgba(0,200,83,.6), 0 0 40px rgba(0,200,83,.3), inset 0 1px 0 rgba(255,255,255,.2) !important;
+  font-size: 14px !important;
+  letter-spacing: .5px;
+  text-shadow: 0 1px 3px rgba(0,0,0,.5);
+  animation: openPulse 2s infinite;
+}
+@keyframes lockPulse {
+  0%,100%{box-shadow:0 0 20px rgba(255,0,0,.6),0 0 40px rgba(255,0,0,.3),inset 0 1px 0 rgba(255,255,255,.2)}
+  50%{box-shadow:0 0 35px rgba(255,0,0,.9),0 0 60px rgba(255,0,0,.5),inset 0 1px 0 rgba(255,255,255,.2)}
+}
+@keyframes openPulse {
+  0%,100%{box-shadow:0 0 20px rgba(0,200,83,.6),0 0 40px rgba(0,200,83,.3),inset 0 1px 0 rgba(255,255,255,.2)}
+  50%{box-shadow:0 0 35px rgba(0,200,83,.9),0 0 60px rgba(0,200,83,.5),inset 0 1px 0 rgba(255,255,255,.2)}
+}
+@keyframes borderAnim{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+
+/* ====== COMPLAINT BUTTON ====== */
+.complaint-btn-main {
+  display: block;
+  width: 100%;
+  padding: 9px 14px;
+  margin-top: 10px;
+  background: linear-gradient(135deg,#ff6b35,#d63031);
+  color: #fff;
+  border: none;
+  border-radius: 14px;
+  font-size: 13px;
+  font-weight: 700;
+  font-family: 'Cairo',sans-serif;
+  cursor: pointer;
+  box-shadow: 0 3px 12px rgba(214,48,49,.35);
+  transition: all .25s;
+  letter-spacing: .3px;
+}
+.complaint-btn-main:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(214,48,49,.5)}
+
+/* ====== COMPLAINT MODAL ====== */
+.complaint-modal-body {
+  background: linear-gradient(135deg,var(--CB),var(--BG));
+  border-radius: 20px;
+  padding: 24px 20px;
+  max-width: 500px;
+  width: 100%;
+  box-shadow: 0 20px 60px rgba(0,0,0,.4), 0 0 0 1px rgba(214,48,49,.2);
+  animation: popIn .3s ease;
+  max-height: 92vh;
+  overflow-y: auto;
+}
+.complaint-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding-bottom: 14px;
+  border-bottom: 2px solid var(--BR);
+}
+.complaint-modal-icon {
+  width: 48px; height: 48px;
+  border-radius: 14px;
+  background: linear-gradient(135deg,#ff6b35,#d63031);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px;
+  box-shadow: 0 4px 12px rgba(214,48,49,.35);
+  flex-shrink: 0;
+}
+.complaint-modal-title { font-size: 18px; font-weight: 900; color: var(--TX); }
+.complaint-modal-subtitle { font-size: 12px; color: var(--TS); margin-top: 2px; }
+.complaint-student-info {
+  background: linear-gradient(135deg,rgba(214,48,49,.08),rgba(255,107,53,.05));
+  border: 1.5px solid rgba(214,48,49,.2);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.complaint-student-icon { font-size: 22px; }
+.complaint-student-name { font-size: 14px; font-weight: 800; color: var(--TX); }
+.complaint-student-phone-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.complaint-student-phone { font-size: 13px; color: var(--TS); font-family: monospace; direction: ltr; }
+.complaint-phone-toggle { background: var(--IB); border: 1.5px solid var(--BR); border-radius: 8px; padding: 3px 8px; cursor: pointer; font-size: 11px; font-family: 'Cairo',sans-serif; font-weight: 700; color: var(--TS); transition: .2s; }
+.complaint-phone-toggle:hover { border-color: var(--P); color: var(--P); }
+.complaint-warn {
+  background: linear-gradient(135deg,rgba(249,171,0,.12),rgba(249,171,0,.06));
+  border: 1.5px solid rgba(249,171,0,.4);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  font-size: 12px;
+  color: var(--TX);
+  line-height: 1.7;
+}
+.complaint-warn strong { color: #e67e00; }
+.complaint-textarea {
+  width: 100%;
+  padding: 14px 16px;
+  border: 2px solid var(--BR);
+  border-radius: 14px;
+  font-size: 14px;
+  font-family: 'Cairo',sans-serif;
+  background: var(--IB);
+  color: var(--TX);
+  outline: none;
+  resize: vertical;
+  min-height: 100px;
+  transition: border-color .2s, box-shadow .2s;
+  line-height: 1.7;
+  margin-bottom: 14px;
+}
+.complaint-textarea:focus { border-color: #d63031; box-shadow: 0 0 0 3px rgba(214,48,49,.12); }
+.complaint-send-btn {
+  width: 100%;
+  padding: 13px;
+  background: linear-gradient(135deg,#ff6b35,#d63031);
+  color: #fff;
+  border: none;
+  border-radius: 14px;
+  font-size: 15px;
+  font-weight: 700;
+  font-family: 'Cairo',sans-serif;
+  cursor: pointer;
+  box-shadow: 0 4px 15px rgba(214,48,49,.35);
+  transition: all .25s;
+  margin-bottom: 8px;
+}
+.complaint-send-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(214,48,49,.5); }
+.complaint-cancel-btn {
+  width: 100%;
+  padding: 11px;
+  background: var(--IB);
+  color: var(--TS);
+  border: 1.5px solid var(--BR);
+  border-radius: 14px;
+  font-size: 14px;
+  font-weight: 700;
+  font-family: 'Cairo',sans-serif;
+  cursor: pointer;
+  transition: all .2s;
+}
+.complaint-cancel-btn:hover { border-color: var(--TX); color: var(--TX); }
 .big-warn{background:linear-gradient(135deg,var(--D),#c0392b);color:#fff;padding:13px 18px;border-radius:14px;text-align:center;font-size:14px;font-weight:700;margin-bottom:16px}
 
 .exam-list-card{background:var(--CB);border-radius:20px;padding:18px;margin-bottom:12px;border:1px solid var(--BR);box-shadow:var(--SH);display:flex;align-items:center;gap:14px;cursor:pointer;transition:.2s}
@@ -363,7 +533,7 @@ body.dark .honor-prog{background:rgba(255,255,255,.15)}
 
 <button id="adminOpenBtn" class="admin-open" onclick="showAdminAuth()">⚙️ لوحة التحكم</button>
 
-<div class="credits"><strong>برمجة:</strong> محمود محمد جمعه<br><strong>أ/</strong> محمد جمال | أطواب</div>
+<div class="credits"><strong>برمجة:</strong> محمود محمد محمود جمعه<br><strong>أ/</strong> محمد جمال | أطواب</div>
 
 <!-- WELCOME SCREEN -->
 <div id="welcomeScreen" class="welcome">
@@ -427,6 +597,7 @@ body.dark .honor-prog{background:rgba(255,255,255,.15)}
       <button class="atab" onclick="switchTab('global',this)">⚙️ إعدادات عامة</button>
       <button class="atab" onclick="switchTab('stats',this)">📈 إحصائيات</button>
       <button class="atab" onclick="switchTab('logs',this)">🕒 السجل</button>
+      <button class="atab" onclick="switchTab('complaints',this)">📢 الشكاوى</button>
     </div>
 
     <!-- EXAMS LIST -->
@@ -496,6 +667,17 @@ body.dark .honor-prog{background:rgba(255,255,255,.15)}
     <div id="tab-logs" class="atab-content">
       <div class="asec"><h3>🕒 سجل الأدمن</h3>
         <div id="logsContainer"></div>
+      </div>
+    </div>
+
+    <!-- COMPLAINTS -->
+    <div id="tab-complaints" class="atab-content">
+      <div class="asec"><h3>📢 الشكاوى الواردة</h3>
+        <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+          <button class="abtn bg-blue" onclick="loadAdminComplaints()">🔄 تحديث</button>
+          <button class="abtn bg-red" onclick="clearAllComplaints()">🗑️ حذف الكل</button>
+        </div>
+        <div id="complaintsContainer"><p style="color:var(--TS);text-align:center;padding:20px">اضغط تحديث لعرض الشكاوى</p></div>
       </div>
     </div>
   </div>
@@ -617,7 +799,42 @@ body.dark .honor-prog{background:rgba(255,255,255,.15)}
 </div>
 </div>
 
-<!-- ============ ADD EXAM MODAL ============ -->
+<!-- ============ COMPLAINT MODAL ============ -->
+<div id="complaintModal" class="modal-ov">
+  <div class="complaint-modal-body">
+    <div class="complaint-modal-header">
+      <div class="complaint-modal-icon">📢</div>
+      <div>
+        <div class="complaint-modal-title">تقديم شكوى</div>
+        <div class="complaint-modal-subtitle">سيتم إرسال شكواك مباشرة للأستاذ</div>
+      </div>
+    </div>
+
+    <div id="complaintStudentInfo" class="complaint-student-info" style="display:none">
+      <div class="complaint-student-icon">👤</div>
+      <div style="flex:1">
+        <div class="complaint-student-name" id="complaintStudentName">-</div>
+        <div class="complaint-student-phone-row">
+          <span class="complaint-student-phone" id="complaintStudentPhone">-</span>
+          <button class="complaint-phone-toggle" id="complaintPhoneToggle" onclick="toggleComplaintPhone()">👁️ إظهار</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="complaint-warn">
+      ⚠️ <strong>تحذير:</strong> هذه الشكوى مسجلة باسمك ورقم هاتفك.<br>
+      🚫 أي شكوى تحتوي على <strong>سب أو قذف أو تحرش</strong> ستعرضك للمساءلة القانونية.
+    </div>
+
+    <textarea class="complaint-textarea" id="complaintText" placeholder="اكتب شكواك هنا... (اشرح المشكلة بوضوح وأدب)" rows="4"></textarea>
+
+    <button class="complaint-send-btn" onclick="sendComplaint()">📤 إرسال الشكوى للأستاذ</button>
+    <button class="complaint-cancel-btn" onclick="closeModal('complaintModal')">✖ إلغاء</button>
+  </div>
+</div>
+
+<!-- ============ ADMIN COMPLAINTS TAB ============ -->
+
 <div id="addExamModal" class="modal-ov">
   <div class="modal">
     <h3>➕ إضافة امتحان جديد</h3>
@@ -1047,6 +1264,9 @@ body.dark .honor-prog{background:rgba(255,255,255,.15)}
       </div>
     </div>
     <div id="honorSection" style="display:none;margin-top:16px"></div>
+    <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--BR)">
+      <button class="complaint-btn-main" onclick="openComplaintModal()">📢 تقديم شكوى للأستاذ</button>
+    </div>
   </div>
 </div>
 
@@ -1657,7 +1877,16 @@ function renderExamDashboard(ex){
     el.innerText=on?onTxt:offTxt;
     el.className='abtn '+(on?onCls:offCls);
   };
-  setT('examOpenBtn',!ex.closed,'🔒 قفل الامتحان','🔓 فتح الامتحان','bg-red','bg-green');
+  const lockBtn=document.getElementById('examOpenBtn');
+  if(lockBtn){
+    if(!ex.closed){
+      lockBtn.innerText='🔒 قفل الامتحان الآن';
+      lockBtn.className='abtn exam-lock-btn-locked';
+    } else {
+      lockBtn.innerText='🔓 فتح الامتحان الآن';
+      lockBtn.className='abtn exam-lock-btn-open';
+    }
+  }
   setT('examPhoneBtn',ex.phoneVisible!==false,'📱 الهاتف: ظاهر','📵 الهاتف: مخفي','bg-green','bg-red');
   setT('examBlockBtn',ex.blockRepeat!==false,'🛡️ منع التكرار: مفعل','🔓 التكرار: معطل','bg-red','bg-green');
   setT('examShowResBtn',ex.showRes,'👁️ النتيجة للطلاب: نعم','👁️ النتيجة للطلاب: لا','bg-green','bg-dark');
@@ -2918,6 +3147,131 @@ window.importMultipleExams=()=>{
   inp.click();
 };
 
+// ===== COMPLAINTS =====
+let _complaintPhoneVisible = false;
+let _complaintPhoneRaw = '';
+
+window.openComplaintModal = () => {
+  const nameVal = document.getElementById('nameInput').value.trim();
+  const phoneVal = document.getElementById('phoneInput').value.trim();
+  document.getElementById('complaintText').value = '';
+  _complaintPhoneVisible = false;
+  _complaintPhoneRaw = phoneVal;
+
+  const infoDiv = document.getElementById('complaintStudentInfo');
+  if (nameVal) {
+    document.getElementById('complaintStudentName').innerText = nameVal;
+    document.getElementById('complaintStudentPhone').innerText = phoneVal ? '••••••••••' : 'لم يُدخل رقم';
+    document.getElementById('complaintPhoneToggle').innerText = '👁️ إظهار';
+    infoDiv.style.display = 'flex';
+  } else {
+    infoDiv.style.display = 'none';
+  }
+  document.getElementById('complaintModal').style.display = 'flex';
+};
+
+window.toggleComplaintPhone = () => {
+  _complaintPhoneVisible = !_complaintPhoneVisible;
+  const phoneEl = document.getElementById('complaintStudentPhone');
+  const toggleBtn = document.getElementById('complaintPhoneToggle');
+  if (_complaintPhoneVisible) {
+    phoneEl.innerText = _complaintPhoneRaw || 'لم يُدخل رقم';
+    toggleBtn.innerText = '🙈 إخفاء';
+  } else {
+    phoneEl.innerText = _complaintPhoneRaw ? '••••••••••' : 'لم يُدخل رقم';
+    toggleBtn.innerText = '👁️ إظهار';
+  }
+};
+
+window.sendComplaint = async () => {
+  const text = document.getElementById('complaintText').value.trim();
+  if (!text) return alert('⚠️ من فضلك اكتب نص الشكوى');
+  if (text.length < 10) return alert('⚠️ الشكوى قصيرة جداً، اشرح المشكلة بوضوح');
+
+  const nameVal = document.getElementById('nameInput').value.trim();
+  const phoneVal = document.getElementById('phoneInput').value.trim();
+  const gradeVal = studentGrade;
+
+  const complaint = {
+    name: nameVal || 'زائر غير مسجل',
+    phone: phoneVal || 'غير متاح',
+    grade: gName(gradeVal),
+    text,
+    time: new Date().toLocaleString('ar-EG'),
+    timestamp: Date.now(),
+    read: false
+  };
+
+  try {
+    await push(ref(db, 'complaints'), complaint);
+    closeModal('complaintModal');
+    alert('✅ تم إرسال شكواك بنجاح. سيتم مراجعتها من قِبل الأستاذ.');
+  } catch(e) {
+    alert('❌ حدث خطأ: ' + e.message);
+  }
+};
+
+window.loadAdminComplaints = async () => {
+  const c = document.getElementById('complaintsContainer');
+  c.innerHTML = '<p style="color:var(--TS);text-align:center;padding:20px">جاري التحميل...</p>';
+  const snap = await get(ref(db, 'complaints'));
+  const data = snap.val();
+  if (!data) { c.innerHTML = '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد شكاوى حتى الآن</p>'; return; }
+  const list = Object.entries(data).sort((a,b) => (b[1].timestamp||0) - (a[1].timestamp||0));
+  c.innerHTML = list.map(([key, r]) => `
+    <div style="background:var(--CB);border:1.5px solid ${r.read?'var(--BR)':'#d63031'};border-radius:16px;padding:16px;margin-bottom:10px;box-shadow:var(--SH)">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <div>
+          <div style="font-size:15px;font-weight:800;color:var(--TX)">👤 ${r.name}</div>
+          <div style="font-size:12px;color:var(--TS);margin-top:2px">📚 ${r.grade||'-'} &nbsp;|&nbsp; 📱 <span id="phone_${key}" style="font-family:monospace">••••••</span>
+            <button onclick="toggleAdminPhone('${key}','${(r.phone||'').replace(/'/g,"\\'")}',this)" style="background:var(--IB);border:1px solid var(--BR);border-radius:6px;padding:1px 7px;cursor:pointer;font-size:10px;font-family:'Cairo',sans-serif;font-weight:700;color:var(--TS);margin-right:4px;transition:.2s">إظهار</button>
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--TS);text-align:left">${r.time||''}</div>
+      </div>
+      <div style="background:var(--BG);border-radius:12px;padding:12px;font-size:14px;line-height:1.7;color:var(--TX);border-right:3px solid #d63031;margin-bottom:10px">${r.text}</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="abtn bg-green" onclick="markComplaintRead('${key}')" style="padding:6px 12px;font-size:12px">✅ تم الاطلاع</button>
+        <button class="abtn bg-red" onclick="deleteComplaint('${key}')" style="padding:6px 12px;font-size:12px">🗑️ حذف</button>
+      </div>
+    </div>
+  `).join('');
+};
+
+window.toggleAdminPhone = (key, phone, btn) => {
+  const el = document.getElementById('phone_'+key);
+  if (el.innerText.includes('•')) {
+    el.innerText = phone || 'غير متاح';
+    btn.innerText = 'إخفاء';
+  } else {
+    el.innerText = '••••••';
+    btn.innerText = 'إظهار';
+  }
+};
+
+window.markComplaintRead = async (key) => {
+  await update(ref(db, `complaints/${key}`), { read: true });
+  loadAdminComplaints();
+};
+window.deleteComplaint = async (key) => {
+  if (!confirm('حذف الشكوى؟')) return;
+  await remove(ref(db, `complaints/${key}`));
+  loadAdminComplaints();
+};
+window.clearAllComplaints = async () => {
+  if (!confirm('⚠️ حذف كل الشكاوى نهائياً؟')) return;
+  await remove(ref(db, 'complaints'));
+  loadAdminComplaints();
+};
+
+// ===== COMPLAINTS LISTENER (badge for admin) =====
+onValue(ref(db,'complaints'), (snap) => {
+  const data = snap.val();
+  const unread = data ? Object.values(data).filter(c => !c.read).length : 0;
+  const tab = document.querySelector('[onclick="switchTab(\'complaints\',this)"]');
+  if (tab) tab.innerText = unread > 0 ? `📢 الشكاوى (${unread})` : '📢 الشكاوى';
+});
+
 // ===== INIT =====
 loadGrade();
 const sb=document.getElementById('soundBtn');
@@ -2931,4 +3285,4 @@ const urlExamId=new URLSearchParams(location.search).get('exam');
 if(urlExamId) window._directExamId=urlExamId;
 </script>
 </body>
-</html>
+            </html>
