@@ -8,7 +8,9 @@ import {
   get,
   push,
   remove,
-  onDisconnect,
+  query,
+  limitToLast,
+  serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/9.6.1/firebase-database.js";
 
 const FC = {
@@ -21,11 +23,20 @@ const FC = {
 const app = initializeApp(FC);
 const db = getDatabase(app);
 
-const ADMIN_PASS = "mybestmr123";
+// كلمة سر المالك الافتراضية محفوظة كـ hash (PBKDF2) وليس كنص صريح.
+const OWNER_DEFAULT = {
+  salt: "E3dhh/6S5BaU1O0u0SKUDA==",
+  hash: "THYsBk2NC80ftMUAobNNpvmcW5DHnEFxv0DbR5Z7BzM=",
+};
+let adminAccounts = {};
+let ownerProfile = { name: "مالك الموقع", photo: "" };
+let pendingAdminProfilePhoto = null;
+let pendingNewAdminPhoto = "";
+let pendingSiteBackground = "";
 let exams = [];
 let bankQs = [];
-let studentName = "",
-  studentGrade = "";
+let studentName = "";
+let gradingTarget = null;
 let cur = 0,
   answers = [],
   flags = [],
@@ -35,10 +46,7 @@ let currentExamId = null;
 let editingQIdx = -1,
   editingBankIdx = -1;
 let qeCorrect = 0,
-  qeGrade = "second",
-  bCorrect = 0,
-  bGrade = "second";
-let newExamGrade = "second";
+  bCorrect = 0;
 let soundOn = true,
   fontSize = "normal";
 let isPreview = false;
@@ -74,12 +82,36 @@ window.toggleDark = () => {
 };
 function updateWelcomeBg() {
   const ws = document.getElementById("welcomeScreen");
-  if (document.body.classList.contains("dark"))
+  if (!ws) return;
+  const dark = document.body.classList.contains("dark");
+  const b = window._branding || {};
+  const image = safeImageSource(b.backgroundImage);
+  const presets = {
+    ocean: dark
+      ? "linear-gradient(145deg,#07111d,#12334a)"
+      : "linear-gradient(145deg,#0d3548,#176c63)",
+    sand: dark
+      ? "linear-gradient(145deg,#1d1b17,#3b3021)"
+      : "linear-gradient(145deg,#b98a4b,#f0d8a6)",
+    night: "linear-gradient(145deg,#07111d,#172238)",
+    olive: dark
+      ? "linear-gradient(145deg,#111a18,#263a2d)"
+      : "linear-gradient(145deg,#344a3d,#a8b98c)",
+  };
+  const overlay = dark
+    ? "linear-gradient(145deg,rgba(5,12,22,.78),rgba(9,25,38,.82))"
+    : "linear-gradient(145deg,rgba(7,26,38,.58),rgba(13,51,63,.5))";
+  if (image && b.backgroundPreset === "custom") {
+    ws.style.background = `${overlay},url("${image}") center/cover fixed no-repeat`;
+  } else if (presets[b.backgroundPreset]) {
+    ws.style.background = presets[b.backgroundPreset];
+  } else if (dark) {
     ws.style.background =
       "linear-gradient(160deg,#070d1a 0%,#0f1929 50%,#081d3a 100%)";
-  else
+  } else {
     ws.style.background =
       "linear-gradient(160deg,#0a1628 0%,#1a2a4a 50%,#0d3b6e 100%)";
+  }
 }
 
 // ===== FIREBASE =====
@@ -97,6 +129,7 @@ onValue(ref(db, "exams"), (snap) => {
   const d = snap.val();
   exams = d ? Object.values(d) : [];
   renderExamsList();
+  refreshStudentExamList();
   if (currentExamId) {
     const ex = exams.find((e) => e.id === currentExamId);
     if (ex) renderExamDashboard(ex);
@@ -111,29 +144,20 @@ onValue(ref(db, "bankQuestions"), (snap) => {
     renderBankList();
 });
 
-// ===== GRADE =====
-window.selGrade = (g) => {
-  studentGrade = g;
-  document
-    .querySelectorAll(".grade-btn")
-    .forEach((b) => b.classList.remove("on"));
-  document.querySelector(`.grade-btn[data-g="${g}"]`).classList.add("on");
-  localStorage.setItem("grade", g);
-};
-function loadGrade() {
-  selGrade("second");
+function questionPoints(q) {
+  const p = Number(q?.points);
+  return Number.isFinite(p) && p > 0 ? p : 1;
 }
-const gName = (g) =>
-  g === "first"
-    ? "الأول الثانوي"
-    : g === "second"
-      ? "بكالوريا"
-      : g === "third"
-        ? "الثالث الثانوي"
-        : "كل الصفوف";
-const gIcon = (g) =>
-  g === "first" ? "🏫" : g === "second" ? "📖" : g === "third" ? "🎓" : "📚";
+function hasEssayQuestions(r) {
+  return (r?.questionsSnapshot || []).some((q) => q.type === "essay");
+}
+function isResultGradingComplete(r) {
+  return !hasEssayQuestions(r) || r.essayGraded === true;
+}
+const escapeExamHtml = (v) => esc(v);
+const fmtNum = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
 
+// ===== (تم حذف الصفوف الدراسية) =====
 // ===== WELCOME =====
 window.showWelcome = async () => {
   const name = document.getElementById("nameInput").value.trim();
@@ -142,20 +166,14 @@ window.showWelcome = async () => {
     return alert("الاسم يجب أن يكون ثلاثياً أو رباعياً");
 
   // Pick global phone visibility from any exam? we'll keep simple: require phone if any visible exam has phoneVisible!=false (default true)
-  const visibleExams = exams.filter(
-    (e) => e.grade === "all" || e.grade === studentGrade,
-  );
+  const visibleExams = exams.filter((e) => !e.archived);
   const phoneRequired = visibleExams.some((e) => e.phoneVisible !== false);
   if (phoneRequired && phone.length < 11)
     return alert("أدخل رقم هاتف صحيح (11 رقم)");
 
   studentName = name;
   document.getElementById("wStudentName").innerText = "مرحباً، " + name;
-  document.getElementById("wStudentGrade").innerText =
-    gIcon(studentGrade) + " " + gName(studentGrade);
   updateWelcomeBg();
-  if (window._setPresence)
-    window._setPresence({ state: "welcome", name, exam: "" });
   buildExamList();
   loadHonorForWelcome();
   document.getElementById("welcomeScreen").style.display = "block";
@@ -167,9 +185,7 @@ async function loadHonorForWelcome() {
   // exams visible to this student that have showHonor enabled
   const myExams = exams.filter(
     (e) =>
-      !e.archived &&
-      (e.grade === "all" || e.grade === studentGrade) &&
-      e.showHonor,
+      !e.archived && e.showHonor,
   );
   if (!myExams.length) {
     sec.style.display = "none";
@@ -177,14 +193,12 @@ async function loadHonorForWelcome() {
     return;
   }
   let html =
-    '<div class="honor-board"><div class="honor-board-title">🏆 لوحة شرف ' +
-    gName(studentGrade) +
-    " 🏆</div>";
+    '<div class="honor-board"><div class="honor-board-title">🏆 لوحة الشرف 🏆</div>';
   for (const ex of myExams) {
     const list = await getExamResults(ex.id);
-    const myGrade = list.filter((r) => r.gradeKey === studentGrade);
-    if (!myGrade.length) continue;
-    const ranked = buildRankedList(myGrade, 10);
+    const done = list.filter(isResultGradingComplete);
+    if (!done.length) continue;
+    const ranked = buildRankedList(done, 10);
     html += `<div class="honor-exam-block">
       <div class="honor-exam-name">${ex.emoji || "📋"} ${ex.name}</div>
       <div class="honor-podium">`;
@@ -228,15 +242,10 @@ function buildExamList() {
   const container = document.getElementById("wExamsList");
   const visible = exams
     .filter((e) => !e.archived)
-    .filter((e) => e.grade === "all" || e.grade === studentGrade)
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
   if (!visible.length) {
     container.innerHTML =
-      '<div class="no-exams">لا توجد امتحانات متاحة لصفك حالياً</div>';
-    return;
-  }
-  if (getUiMode() === "new") {
-    container.innerHTML = renderDashboard(visible);
+      '<div class="no-exams">لا توجد امتحانات متاحة حالياً</div>';
     return;
   }
   container.innerHTML = visible
@@ -260,10 +269,24 @@ function buildExamList() {
 }
 
 window.startExam = async (examId) => {
-  closeWelcome();
-  const ex = exams.find((e) => e.id === examId);
-  if (!ex) return alert("الامتحان غير موجود");
-  if (ex.closed) return alert("الامتحان مقفل حالياً");
+  // طبّق الجدولة ثم اقرأ أحدث حالة للامتحان من قاعدة البيانات (عشان القفل يشتغل فوراً)
+  applySchedules();
+  let ex = exams.find((e) => e.id === examId);
+  try {
+    const fresh = (await get(ref(db, `exams/${examId}`))).val();
+    if (fresh) ex = fresh;
+    else if (fresh === null && ex) ex = null;
+  } catch (e) {
+    console.warn("تعذر قراءة حالة الامتحان من الخادم، سيتم استخدام النسخة المحلية", e);
+  }
+  if (!ex) {
+    buildExamList();
+    return alert("الامتحان غير موجود");
+  }
+  if (ex.closed) {
+    buildExamList();
+    return alert("🔒 الامتحان مقفل حالياً");
+  }
   if (!ex.questions || !ex.questions.length)
     return alert("لا توجد أسئلة في هذا الامتحان");
 
@@ -277,13 +300,15 @@ window.startExam = async (examId) => {
   // attempts limit
   const allRes = (await get(ref(db, `examResults/${ex.id}`))).val() || {};
   const past = Object.values(allRes).filter(
-    (r) => r.gradeKey === studentGrade && r.name === studentName,
+    (r) => r.name === studentName,
   );
   if (ex.blockRepeat !== false && past.length > 0)
     return alert("⚠️ لقد أديت هذا الامتحان مسبقاً!");
   if (ex.maxAttempts && ex.maxAttempts > 0 && past.length >= ex.maxAttempts) {
     return alert(`⚠️ استنفدت عدد المحاولات المسموح (${ex.maxAttempts})`);
   }
+
+  closeWelcome();
 
   // apply per-exam color
   if (ex.color) {
@@ -329,7 +354,7 @@ function launch(ex) {
   let qs = [...ex.questions];
   if (ex.shuffleA) {
     qs = qs.map((q) => {
-      if (isEssay(q)) return q;
+      if (q.type === "essay") return q;
       const idx = [0, 1, 2, 3];
       const sh = shuffleArr(idx);
       return { ...q, a: sh.map((i) => q.a[i]), c: sh.indexOf(q.c) };
@@ -346,13 +371,9 @@ function launch(ex) {
   document.body.classList.add("exam-mode");
   document.getElementById("examWrap").style.display = "block";
   document.getElementById("sNameDisp").innerText = studentName;
-  document.getElementById("sGradeBadge").innerText =
-    gIcon(studentGrade) + " " + gName(studentGrade);
   buildSidebarGrid(window._qs);
   renderQ();
   startTimer();
-  if (window._setPresence)
-    window._setPresence({ state: "exam", name: studentName, exam: ex.name });
   logAction(`دخول الامتحان: ${studentName} - ${ex.name}`);
 }
 
@@ -389,18 +410,29 @@ function renderQ() {
   document.getElementById("flagBtn").className =
     "flag-btn" + (flags[cur] ? " on" : "");
   const letters = ["أ", "ب", "ج", "د"];
-  document.getElementById("optionsDiv").innerHTML = q.a
-    .map(
-      (a, i) => `
+  const optionsDiv = document.getElementById("optionsDiv");
+  if (q.type === "essay") {
+    optionsDiv.innerHTML = `
+      <div class="essay-answer-wrap">
+        <label for="essayAnswerInput">إجابتك المقالية</label>
+        <textarea id="essayAnswerInput" rows="7" maxlength="6000"
+          placeholder="اكتب إجابتك هنا..."
+          oninput="setEssayAnswer(this.value)">${esc(answers[cur] || "")}</textarea>
+        <small>الدرجة القصوى: ${questionPoints(q)}</small>
+      </div>`;
+  } else {
+    optionsDiv.innerHTML = (q.a || [])
+      .map(
+        (a, i) => `
     <div class="opt${answers[cur] === i ? " on" : ""}" onclick="pickAns(${i},this)">
       <input type="radio" name="ans">
       <div class="opt-mark">${letters[i]}</div>
       <span>${a}</span>
     </div>
   `,
-    )
-    .join("");
-  if (isEssay(q)) renderEssayInput(q);
+      )
+      .join("");
+  }
   renderNav();
   updateProg();
   updateSidebarGrid();
@@ -413,6 +445,11 @@ window.pickAns = (i, el) => {
   updateSidebarGrid();
   updateProg();
   playSound("ans");
+};
+window.setEssayAnswer = (value) => {
+  answers[cur] = String(value || "");
+  updateSidebarGrid();
+  updateProg();
 };
 window.flagQ = () => {
   flags[cur] = !flags[cur];
@@ -482,7 +519,7 @@ function buildSidebarGrid(qs) {
     g.appendChild(d);
   });
   document.getElementById("sideInfo").innerHTML =
-    `${studentName}<br><small style="color:var(--TS)">${gName(studentGrade)}</small>`;
+    `${esc(studentName)}`;
 }
 function updateSidebarGrid() {
   const qs = window._qs || [];
@@ -490,7 +527,7 @@ function updateSidebarGrid() {
     const el = document.getElementById("qn" + i);
     if (!el) return;
     el.className = "qn";
-    if (answers[i] !== undefined) el.classList.add("ans");
+    if (answers[i] !== undefined && answers[i] !== "") el.classList.add("ans");
     if (flags[i]) el.classList.add("flg");
     if (cur === i) el.classList.add("cur");
   });
@@ -499,52 +536,41 @@ function updateSidebarGrid() {
 // ===== SUBMIT =====
 window.submitExam = async (auto = false) => {
   if (!auto) {
-    const un = answers.filter((a) => a === undefined).length;
+    const un = answers.filter((a) => a === undefined || a === "").length;
     if (un > 0 && !confirm(`لم تجب على ${un} سؤال. هل تريد التسليم؟`)) return;
   }
   clearInterval(timerInt);
   const qs = window._qs;
   const ex = window._currentExam;
-  let score = 0,
-    totalPts = 0,
-    essayMax = 0,
-    hasEssay = false;
+  let score = 0;
+  const total = qs.reduce((sum, q) => sum + questionPoints(q), 0);
+  const essayIndices = [];
   qs.forEach((q, i) => {
-    totalPts += qPoints(q);
-    if (isEssay(q)) {
-      hasEssay = true;
-      essayMax += qPoints(q);
-    } else if (answers[i] === q.c) score++;
+    if (q.type === "essay") essayIndices.push(i);
+    else if (answers[i] === q.c) score += questionPoints(q);
   });
   if (isPreview) {
-    alert(`✅ معاينة: ${score}/${totalPts}${hasEssay ? " (بدون المقالي)" : ""}`);
+    alert(`✅ معاينة: ${score}/${total}${essayIndices.length ? " (+ أسئلة مقالية تُصحَّح يدوياً)" : ""}`);
     location.reload();
     return;
   }
   const code = Math.floor(10000 + Math.random() * 90000).toString();
-  const snap = qs.map((q) => {
-    const o = { q: q.q, a: [...q.a], c: q.c, ctx: q.ctx || "" };
-    if (isEssay(q)) {
-      o.type = "essay";
-      o.maxMark = qPoints(q);
-      o.model = q.model || "";
-    }
-    return o;
-  });
-  const pct = Math.round((score / totalPts) * 100);
+  const snap = qs.map((q) => ({
+    q: q.q,
+    a: [...(q.a || [])],
+    c: q.c ?? null,
+    ctx: q.ctx || "",
+    type: q.type === "essay" ? "essay" : "choice",
+    points: questionPoints(q),
+  }));
+  const pct = total ? Math.round((score / total) * 100) : 0;
   const passMark = ex.passMark || 50;
-  const passed = hasEssay ? false : pct >= passMark;
+  const passed = essayIndices.length ? null : pct >= passMark;
   const rd = {
     code,
     name: studentName,
-    grade: gName(studentGrade),
-    gradeKey: studentGrade,
     score,
-    total: totalPts,
-    mcqScore: score,
-    hasEssay,
-    pending: hasEssay,
-    essayMax,
+    total,
     userAnswers: answers.map((a) => (a === undefined ? null : a)),
     questionsSnapshot: snap,
     time: new Date().toLocaleString("ar-EG"),
@@ -552,6 +578,10 @@ window.submitExam = async (auto = false) => {
     examName: ex.name,
     passed,
     passMark,
+    essayGraded: essayIndices.length === 0,
+    essayPending: essayIndices.length > 0,
+    pendingEssayCount: essayIndices.length,
+    essayScores: {},
   };
   await set(ref(db, `examResults/${ex.id}/${code}`), rd);
   await set(ref(db, "results/" + code), rd);
@@ -563,11 +593,9 @@ window.submitExam = async (auto = false) => {
   playSound("submit");
 
   const customMsg = ex.endMsg && ex.endMsg.trim() ? "\n\n" + ex.endMsg : "";
-  let resultMsg = `✅ تم تسليم الامتحان بنجاح!\n\n🔑 كودك الشخصي: ${code}\n\n📌 احتفظ بهذا الكود — يمكنك به مراجعة نتيجتك لاحقاً${customMsg}`;
+  let resultMsg = `✅ تم تسليم الامتحان بنجاح!\n\n🔑 كودك الشخصي: ${code}\n\n📌 احتفظ بهذا الكود — يمكنك به مراجعة نتيجتك لاحقاً${essayIndices.length ? "\n\n✍️ النتيجة معلّقة حتى ينتهي المدرس من تصحيح الأسئلة المقالية." : ""}${customMsg}`;
 
-  if (hasEssay)
-    resultMsg += "\n\n⏳ يوجد أسئلة مقالية — ستظهر نتيجتك بعد ما يصححها الأستاذ. ادخل بكودك لاحقاً.";
-  if (ex.showRes || hasEssay) {
+  if (ex.showRes) {
     // show inline result but hide score (student will search by code to see score)
     showInlineResult({
       ...rd,
@@ -584,24 +612,30 @@ window.submitExam = async (auto = false) => {
     location.reload();
   }
   logAction(
-    `تسليم: ${studentName} - ${ex.name} - ${hasEssay ? "بانتظار تصحيح المقالي" : score + "/" + totalPts + " - " + (passed ? "ناجح" : "راسب")}`,
+    `تسليم: ${studentName} - ${ex.name} - ${essayIndices.length ? "بانتظار تصحيح المقالي" : `${score}/${total} - ${passed ? "ناجح" : "راسب"}`}`,
   );
 };
 
 function showInlineResult(d) {
-  const pct = Math.round((d.score / d.total) * 100);
+  const total = Number(d.total) || 0;
+  const score = Number(d.score) || 0;
+  const waitingForEssays = hasEssayQuestions(d) && !isResultGradingComplete(d);
+  const pct = total ? Math.round((score / total) * 100) : 0;
   const passMark = d.passMark || 50;
   const passed = pct >= passMark;
-  const hideScore = !!d._hideScore || !!d.pending;
+  const hideScore = !!d._hideScore || waitingForEssays;
+  const none = (v) => v === undefined || v === null;
   document.getElementById("rName").innerText = hideScore
-    ? `✅ ${d.name} — تم التسليم`
+    ? waitingForEssays
+      ? `تم استلام إجابة ${d.name}`
+      : `✅ ${d.name} — تم التسليم`
     : `${passed ? "🎉" : "📚"} ${d.name}`;
   if (hideScore) {
     document.getElementById("rCircle").innerHTML =
       `<span style="font-size:32px">✅</span><small>تم</small>`;
   } else {
     document.getElementById("rCircle").innerHTML =
-      `<span style="font-size:26px">${d.score}/${d.total}</span><small>درجتك</small>`;
+      `<span style="font-size:26px">${fmtNum(score)}/${fmtNum(total)}</span><small>درجتك</small>`;
   }
   const grade =
     pct >= 90
@@ -615,51 +649,51 @@ function showInlineResult(d) {
             : "يحتاج مراجعة 📚";
   if (hideScore) {
     document.getElementById("rPct").innerHTML =
-      `<span style="font-size:16px;color:var(--S);font-weight:800">تم تسجيل إجاباتك بنجاح</span>`;
+      `<span style="font-size:16px;color:var(--S);font-weight:800">${
+        waitingForEssays
+          ? "النتيجة هتظهر بعد ما المدرس يراجع كل الأسئلة المقالية."
+          : "تم تسجيل إجاباتك بنجاح"
+      }</span>`;
   } else {
     document.getElementById("rPct").innerHTML =
       `${pct}% - ${grade}<br><span style="font-size:13px;color:${passed ? "var(--S)" : "var(--D)"};font-weight:700">${passed ? "✅ ناجح" : "❌ راسب"} (النجاح من ${passMark}%)</span>`;
   }
-  let topMsg = `<div style="background:var(--SL);color:var(--S);padding:10px 14px;border-radius:11px;font-weight:700;margin-bottom:10px">🎓 ${d.grade} | 📅 ${d.time}</div>`;
-  if (d.pending && d.code) {
-    topMsg += `<div style="background:linear-gradient(135deg,#fff3cd,#ffeaa7);color:#856404;padding:14px 16px;border-radius:11px;font-weight:800;margin-bottom:10px;font-size:15px;border:2px solid #ffc107;text-align:center">🔑 كودك: <span style="font-size:20px;letter-spacing:2px">${d.code}</span></div>`;
-  }
+  let topMsg = `<div style="background:var(--SL);color:var(--S);padding:10px 14px;border-radius:11px;font-weight:700;margin-bottom:10px">🎓 ${esc(d.name)} | 📅 ${esc(d.time)}</div>`;
   if (hideScore && d._code) {
-    topMsg += `<div style="background:linear-gradient(135deg,#fff3cd,#ffeaa7);color:#856404;padding:14px 16px;border-radius:11px;font-weight:800;margin-bottom:10px;font-size:15px;border:2px solid #ffc107;text-align:center">🔑 كودك الشخصي: <span style="font-size:20px;letter-spacing:2px">${d._code}</span><br><span style="font-size:12px;font-weight:700;color:#856404;margin-top:4px;display:block">📌 احتفظ بهذا الكود — ستحتاجه لمراجعة نتيجتك</span></div>`;
+    topMsg += `<div style="background:linear-gradient(135deg,#fff3cd,#ffeaa7);color:#856404;padding:14px 16px;border-radius:11px;font-weight:800;margin-bottom:10px;font-size:15px;border:2px solid #ffc107;text-align:center">🔑 كودك الشخصي: <span style="font-size:20px;letter-spacing:2px">${esc(d._code)}</span><br><span style="font-size:12px;font-weight:700;color:#856404;margin-top:4px;display:block">📌 احتفظ بهذا الكود — ستحتاجه لمراجعة نتيجتك</span></div>`;
+  }
+  if (waitingForEssays) {
+    topMsg += `<div class="essay-pending-notice" role="status">تم تسليم إجاباتك المقالية. لن تظهر الدرجة أو النتيجة قبل ما المدرس يخلّص التصحيح.</div>`;
   }
   if (d._endMsg && d._endMsg.trim()) {
-    topMsg += `<div style="background:var(--PL);color:var(--P);padding:10px 14px;border-radius:11px;font-weight:700;margin-bottom:10px;white-space:pre-wrap">💬 ${d._endMsg}</div>`;
+    topMsg += `<div style="background:var(--PL);color:var(--P);padding:10px 14px;border-radius:11px;font-weight:700;margin-bottom:10px;white-space:pre-wrap">💬 ${esc(d._endMsg)}</div>`;
   }
   document.getElementById("rMsg").innerHTML = topMsg;
-  if (hideScore) {
+  if (waitingForEssays) {
+    document.getElementById("rTable").innerHTML =
+      '<p class="essay-pending-notice">نتيجتك قيد المراجعة. استخدم كودك مرة تانية بعد انتهاء التصحيح.</p>';
+  } else if (hideScore) {
     document.getElementById("rTable").innerHTML =
       '<p style="color:var(--TS);text-align:center;padding:14px">🔒 أدخل كودك في صفحة "استعلام بالكود" لمشاهدة نتيجتك</p>';
   } else if (d._showCorrect === false) {
     document.getElementById("rTable").innerHTML =
       '<p style="color:var(--TS);text-align:center;padding:14px">🔒 الإجابات الصحيحة غير ظاهرة لهذا الامتحان</p>';
   } else {
-    let h = `<table class="ans-table"><thead><tr><th>#</th><th>السؤال</th><th>إجابتك</th><th>الصحيحة</th><th>نتيجة</th></tr></thead><tbody>`;
-    for (let i = 0; i < d.questionsSnapshot.length; i++) {
-      const q = d.questionsSnapshot[i],
-        ua = d.userAnswers ? d.userAnswers[i] : undefined,
-        ok = ua === q.c;
-      if (isEssay(q)) continue;
-      h += `<tr><td>${i + 1}</td><td style="text-align:right">${q.q}</td><td>${ua != null ? q.a[ua] : "—"}</td><td>${q.a[q.c]}</td><td class="${ok ? "corr" : "wrong"}">${ok ? "✓" : "✗"}</td></tr>`;
+    let h = `<table class="ans-table"><thead><tr><th>#</th><th>السؤال</th><th>إجابتك</th><th>الصحيحة / الدرجة</th><th>النتيجة</th></tr></thead><tbody>`;
+    const snap = d.questionsSnapshot || [];
+    for (let i = 0; i < snap.length; i++) {
+      const q = snap[i];
+      const ua = d.userAnswers?.[i];
+      if (q.type === "essay") {
+        const es = Number(d.essayScores?.[i]) || 0;
+        h += `<tr><td>${i + 1}</td><td style="text-align:right">${q.q}</td><td style="text-align:right;white-space:pre-wrap">${none(ua) || ua === "" ? "—" : esc(ua)}</td><td>تصحيح المدرس</td><td>${fmtNum(es)}/${fmtNum(questionPoints(q))}</td></tr>`;
+      } else {
+        const ok = ua === q.c;
+        h += `<tr><td>${i + 1}</td><td style="text-align:right">${q.q}</td><td>${none(ua) ? "—" : q.a[ua]}</td><td>${q.a[q.c]}</td><td class="${ok ? "corr" : "wrong"}">${ok ? "✓" : "✗"}</td></tr>`;
+      }
     }
     h += `</tbody></table>`;
     document.getElementById("rTable").innerHTML = h;
-  }
-  window._lastResult = d;
-  if (d.pending) {
-    document.getElementById("rName").innerText = `⏳ ${d.name} — بانتظار التصحيح`;
-    document.getElementById("rCircle").innerHTML =
-      `<span style="font-size:32px">⏳</span><small>قيد التصحيح</small>`;
-    document.getElementById("rPct").innerHTML =
-      `<span style="font-size:15px;color:var(--W);font-weight:800">النتيجة ستظهر بعد ما الأستاذ يصحح الأسئلة المقالية</span>`;
-    document.getElementById("rTable").innerHTML =
-      '<p style="color:var(--TS);text-align:center;padding:14px">🔒 النتيجة مخفية لحد ما يتم تصحيح المقالي. ادخل بكودك لاحقاً وهتلاقيها.</p>';
-  } else if (!hideScore && d.hasEssay) {
-    document.getElementById("rTable").innerHTML += renderEssayReview(d);
   }
   document.getElementById("resultScreen").style.display = "block";
 }
@@ -667,10 +701,35 @@ function showInlineResult(d) {
 // ===== RESULT CHECK BY CODE =====
 window.checkResult = async () => {
   const code = document.getElementById("codeInput").value.trim();
-  if (!code) return;
-  const snap = await get(ref(db, "results/" + code));
-  if (!snap.exists()) return alert("❌ الكود غير صحيح");
-  showInlineResult(snap.val());
+  if (!code) return alert("اكتب الكود الأول");
+  if (/[.#$\[\]\/]/.test(code)) return alert("❌ الكود غير صحيح");
+  let d;
+  try {
+    const snap = await get(ref(db, "results/" + code));
+    if (!snap.exists()) return alert("❌ الكود غير صحيح");
+    d = snap.val();
+  } catch (e) {
+    console.error(e);
+    return alert("تعذر الاتصال بالخادم، حاول مرة أخرى.");
+  }
+  // اقرأ إعدادات الامتحان الحالية: لو المدرس قافل "النتيجة للطلاب" يبقى البحث مقفول
+  let ex = exams.find((e) => e.id === d.examId);
+  try {
+    const fresh = (await get(ref(db, `exams/${d.examId}`))).val();
+    if (fresh) ex = fresh;
+  } catch (e) {
+    console.warn(e);
+  }
+  if (ex && !ex.showRes) {
+    return alert(
+      "🔒 النتائج غير متاحة حالياً لهذا الامتحان.\nاحتفظ بكودك وجرّب لاحقاً بعد ما المدرس يفتح النتائج.",
+    );
+  }
+  showInlineResult({
+    ...d,
+    _showCorrect: ex ? !!ex.showCorrect : false,
+    _endMsg: ex ? ex.endMsg || "" : "",
+  });
 };
 
 // ===== ADMIN =====
@@ -678,29 +737,7 @@ window.showAdminAuth = () =>
   (document.getElementById("adminAuthModal").style.display = "flex");
 window.hideAdminAuth = () =>
   (document.getElementById("adminAuthModal").style.display = "none");
-window.checkAdminAuth = () => {
-  const p = document.getElementById("adminPassInput").value;
-  if (p === ADMIN_PASS) {
-    document.getElementById("adminPanel").style.display = "block";
-    backToExamsList();
-    renderBankList();
-    hideAdminAuth();
-    document.getElementById("adminPassInput").value = "";
-    if (window._setPresence) window._setPresence({ state: "admin" });
-    logAction("دخول لوحة التحكم");
-  } else {
-    alert("❌ كلمة السر خطأ!");
-  }
-};
-window.closeAdminPanel = () =>
-  (document.getElementById("adminPanel").style.display = "none");
-
-async function logAction(a) {
-  push(ref(db, "adminLogs"), {
-    action: a,
-    time: new Date().toLocaleString("ar-EG"),
-  });
-}
+// (تسجيل دخول الأدمن وحسابات الأدمن: انظر نهاية الملف)
 
 window.switchTab = (id, btn) => {
   document
@@ -714,7 +751,7 @@ window.switchTab = (id, btn) => {
   if (id === "bank") renderBankList();
   if (id === "logs") loadLogs();
   if (id === "stats") showQuickStats();
-  if (id === "complaints") loadAdminComplaints();
+  if (id === "forum") onForumTabOpened();
 };
 
 window.switchExamTab = (id, btn) => {
@@ -760,7 +797,6 @@ function renderExamsList() {
         <div class="elc-title">${ex.pinned ? "📌 " : ""}${ex.name}${ex.archived ? " 📦" : ""}</div>
         <div class="elc-meta">${ex.desc || "بدون وصف"}</div>
         <div class="elc-badges">
-          <span class="elc-badge">${gIcon(ex.grade || "all")} ${gName(ex.grade || "all")}</span>
           <span class="elc-badge">${cnt} سؤال</span>
           <span class="elc-badge">${Math.floor((ex.time || 1800) / 60)} دقيقة</span>
           <span class="elc-badge ${ex.closed ? "lock" : "open"}">${ex.closed ? "🔒 مقفل" : "🔓 مفتوح"}</span>
@@ -776,25 +812,41 @@ function renderExamsList() {
 
 function applySchedules() {
   const now = Date.now();
-  let changed = false;
   exams.forEach((ex) => {
+    if (!ex || !ex.id) return;
+    let closed = !!ex.closed;
+    const patch = {};
     if (ex.scheduleOpen) {
       const t = new Date(ex.scheduleOpen).getTime();
-      if (now >= t && ex.closed) {
-        ex.closed = false;
-        changed = true;
+      if (!isNaN(t) && now >= t && ex.schedOpenDone !== ex.scheduleOpen) {
+        patch.schedOpenDone = ex.scheduleOpen; // يتنفذ مرة واحدة فقط
+        closed = false;
       }
     }
     if (ex.scheduleClose) {
       const t = new Date(ex.scheduleClose).getTime();
-      if (now >= t && !ex.closed) {
-        ex.closed = true;
-        changed = true;
+      if (!isNaN(t) && now >= t && ex.schedCloseDone !== ex.scheduleClose) {
+        patch.schedCloseDone = ex.scheduleClose;
+        closed = true;
       }
     }
+    if (!Object.keys(patch).length) return;
+    if (closed !== !!ex.closed) patch.closed = closed;
+    Object.assign(ex, patch);
+    update(ref(db, `exams/${ex.id}`), patch).catch((e) =>
+      console.warn("schedule update failed", e),
+    );
   });
-  if (changed) saveExams();
 }
+function refreshStudentExamList() {
+  const ws = document.getElementById("welcomeScreen");
+  if (ws && ws.style.display === "block") buildExamList();
+}
+setInterval(() => {
+  if (!exams.length) return;
+  applySchedules();
+  refreshStudentExamList();
+}, 30000);
 
 window.openExamDashboard = (id) => {
   const ex = exams.find((e) => e.id === id);
@@ -816,7 +868,7 @@ function renderExamDashboard(ex) {
   document.getElementById("edhTitle").innerText =
     ex.name + (ex.pinned ? " 📌" : "") + (ex.archived ? " 📦" : "");
   document.getElementById("edhMeta").innerText =
-    `${gName(ex.grade || "all")} • ${(ex.questions || []).length} سؤال • ${Math.floor((ex.time || 1800) / 60)} دقيقة`;
+    `${(ex.questions || []).length} سؤال • ${Math.floor((ex.time || 1800) / 60)} دقيقة`;
 
   const setT = (id, on, onTxt, offTxt, onCls, offCls) => {
     const el = document.getElementById(id);
@@ -923,23 +975,7 @@ window.openAddExamModal = () => {
   document.getElementById("newExamName").value = "";
   document.getElementById("newExamDesc").value = "";
   document.getElementById("newExamEmoji").value = "📝";
-  newExamGrade = "second";
-  document
-    .querySelectorAll(
-      '#newExamGradeRow .qe-grade-btn, [onclick="selNewExamGrade(this)"]',
-    )
-    .forEach((b) => b.classList.remove("on"));
-  document
-    .querySelector('#newExamGradeRow .qe-grade-btn[data-g="second"]')
-    .classList.add("on");
   document.getElementById("addExamModal").style.display = "flex";
-};
-window.selNewExamGrade = (btn) => {
-  document
-    .querySelectorAll('[onclick="selNewExamGrade(this)"]')
-    .forEach((b) => b.classList.remove("on"));
-  btn.classList.add("on");
-  newExamGrade = btn.dataset.g;
 };
 window.saveNewExam = () => {
   const name = document.getElementById("newExamName").value.trim();
@@ -952,7 +988,6 @@ window.saveNewExam = () => {
     name,
     desc,
     emoji,
-    grade: newExamGrade,
     questions: [],
     closed: false,
     password: "",
@@ -1045,16 +1080,6 @@ window.examEditMeta = () => {
   saveExams();
   renderExamDashboard(ex);
 };
-window.examChangeGrade = () => {
-  const ex = getCurEx();
-  if (!ex) return;
-  const g = prompt("الصف (first / second / third / all):", ex.grade || "first");
-  if (["first", "second", "third", "all"].includes(g)) {
-    ex.grade = g;
-    saveExams();
-    renderExamDashboard(ex);
-  } else if (g !== null) alert("قيمة غير صحيحة");
-};
 window.examDelete = () => {
   const ex = getCurEx();
   if (!ex) return;
@@ -1118,11 +1143,14 @@ function renderExamQList() {
     '<div style="display:flex;flex-direction:column;gap:8px">' +
     ex.questions
       .map((q, i) => {
-        const correctTxt = q.a[q.c] || "";
+        const correctTxt =
+          q.type === "essay"
+            ? `✍️ سؤال مقالي · ${fmtNum(questionPoints(q))} درجة`
+            : `✓ ${(q.a || [])[q.c] || ""}`;
         return `<div class="qi" style="padding:12px 14px">
         <span style="flex:1">
           <strong style="color:var(--P)">${i + 1}.</strong> ${q.q.substring(0, 70)}${q.q.length > 70 ? "..." : ""}
-          <br><small style="color:var(--S);font-weight:700">${isEssay(q) ? "✍️ مقالي — " + qPoints(q) + " درجة" : "✓ " + correctTxt.substring(0, 50)}</small>
+          <br><small style="color:var(--S);font-weight:700">${correctTxt.substring(0, 50)}</small>
         </span>
         <div class="qi-acts">
           <button onclick="openExamQEdit(${i})" title="تعديل">✏️</button>
@@ -1145,7 +1173,8 @@ window.openExamQEdit = (idx) => {
         q: "",
         a: ["", "", "", ""],
         c: 0,
-        grade: ex.grade === "all" ? "second" : ex.grade || "second",
+        type: "choice",
+        points: 1,
       }
       : ex.questions[idx];
   document.getElementById("qEditTitle").innerText =
@@ -1155,18 +1184,19 @@ window.openExamQEdit = (idx) => {
   for (let i = 0; i < 4; i++)
     document.getElementById("qeA" + i).value = q.a?.[i] || "";
   qeCorrect = q.c || 0;
-  qeGrade = q.grade || (ex.grade === "all" ? "second" : ex.grade) || "second";
+  document.getElementById("qeType").value = q.type === "essay" ? "essay" : "choice";
+  document.getElementById("qePoints").value = questionPoints(q);
   // update UI
   document
     .querySelectorAll("#qeAnswersWrap .qe-answer-row")
     .forEach((r, i) => r.classList.toggle("correct", i === qeCorrect));
-  document
-    .querySelectorAll("#qeGradeRow .qe-grade-btn")
-    .forEach((b) => b.classList.toggle("on", b.dataset.g === qeGrade));
-  qeSelectType(isEssay(q) ? "essay" : "mcq");
-  document.getElementById("qeMaxMark").value = q.maxMark || 5;
-  document.getElementById("qeModel").value = q.model || "";
+  toggleExamQuestionType();
   document.getElementById("qEditModal").style.display = "flex";
+};
+window.toggleExamQuestionType = () => {
+  const isEssay = document.getElementById("qeType")?.value === "essay";
+  const sec = document.getElementById("qeAnswersWrap")?.closest(".qe-section");
+  if (sec) sec.style.display = isEssay ? "none" : "block";
 };
 window.qeSelectCorrect = (i) => {
   qeCorrect = i;
@@ -1174,33 +1204,27 @@ window.qeSelectCorrect = (i) => {
     .querySelectorAll("#qeAnswersWrap .qe-answer-row")
     .forEach((r, j) => r.classList.toggle("correct", j === i));
 };
-window.qeSelectGrade = (btn) => {
-  qeGrade = btn.dataset.g;
-  document
-    .querySelectorAll("#qeGradeRow .qe-grade-btn")
-    .forEach((b) => b.classList.remove("on"));
-  btn.classList.add("on");
-};
-
 window.saveExamQ = () => {
   const ex = getCurEx();
   if (!ex) return;
+  const type = document.getElementById("qeType").value === "essay" ? "essay" : "choice";
+  const points = Number(document.getElementById("qePoints").value);
   const q = {
     ctx: document.getElementById("qeCtx").value.trim(),
     q: document.getElementById("qeQ").value.trim(),
-    a: [0, 1, 2, 3].map((i) => document.getElementById("qeA" + i).value.trim()),
-    c: qeCorrect,
-    grade: qeGrade,
+    a:
+      type === "essay"
+        ? []
+        : [0, 1, 2, 3].map((i) => document.getElementById("qeA" + i).value.trim()),
+    c: type === "essay" ? null : qeCorrect,
+    type,
+    points,
     active: true,
   };
   if (!q.q) return alert("أدخل نص السؤال");
-  if (qeType === "essay") {
-    q.type = "essay";
-    q.a = ["", "", "", ""];
-    q.c = 0;
-    q.maxMark = Math.max(0.5, Number(document.getElementById("qeMaxMark").value) || 5);
-    q.model = document.getElementById("qeModel").value.trim();
-  } else if (q.a.some((a) => !a))
+  if (!Number.isFinite(points) || points <= 0)
+    return alert("أدخل درجة صحيحة أكبر من صفر");
+  if (type !== "essay" && q.a.some((a) => !a))
     return alert("املأ جميع الاختيارات الأربعة");
   if (!ex.questions) ex.questions = [];
   if (editingQIdx === -1) ex.questions.push(q);
@@ -1233,10 +1257,7 @@ window.examImportFromBank = () => {
   const ex = getCurEx();
   if (!ex) return;
   if (!bankQs.length) return alert("بنك الأسئلة فارغ");
-  const grade = ex.grade || "all";
-  const filtered =
-    grade === "all" ? bankQs : bankQs.filter((q) => q.grade === grade);
-  if (!filtered.length) return alert("لا توجد أسئلة في البنك مناسبة لهذا الصف");
+  const filtered = bankQs;
   bankPickerSelected.clear();
   const c = document.getElementById("bankPickerList");
   c.innerHTML = filtered
@@ -1247,7 +1268,6 @@ window.examImportFromBank = () => {
       <div style="flex:1">
         <strong style="font-size:13px">${q.q}</strong>
         <br><small style="color:var(--S);font-weight:700">✓ ${q.a[q.c]}</small>
-        <br><small style="color:var(--TS)">${gIcon(q.grade)} ${gName(q.grade)}</small>
       </div>
     </div>
   `,
@@ -1335,34 +1355,109 @@ window.examExportJSON = () => {
 };
 
 // ===== EXAM RESULTS / HONOR =====
-async function getExamResults(examId, includePending = false) {
+async function getExamResults(examId) {
   const snap = await get(ref(db, `examResults/${examId}`));
-  const all = Object.values(snap.val() || {});
-  return includePending ? all : all.filter((r) => !r.pending);
+  return Object.values(snap.val() || {});
 }
 
 window.loadExamResultsTab = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id, true)).sort((a, b) =>
-    a.pending && !b.pending ? -1 : !a.pending && b.pending ? 1 : b.score - a.score,
-  );
+  const list = (await getExamResults(ex.id)).sort((a, b) => {
+    const pa = isResultGradingComplete(a) ? 1 : 0;
+    const pb = isResultGradingComplete(b) ? 1 : 0;
+    return pa - pb || b.score - a.score; // اللي محتاج تصحيح الأول
+  });
   const c = document.getElementById("examResultsArea");
   if (!list.length) {
     c.innerHTML =
       '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد نتائج بعد</p>';
     return;
   }
-  const pend = list.filter((r) => r.pending).length;
-  let h = pend
-    ? `<div style="background:var(--WL);color:#856404;padding:10px 14px;border-radius:11px;font-weight:700;margin-bottom:10px">⏳ ${pend} طالب بانتظار تصحيح المقالي — نتيجتهم مخفية لحد ما تصحح</div>`
-    : "";
-  h += `<table><thead><tr><th>م</th><th>الاسم</th><th>الكود</th><th>الدرجة</th><th>النسبة</th><th>الوقت</th><th>تصحيح</th><th>حذف</th></tr></thead><tbody>`;
+  let h = `<table><thead><tr><th>م</th><th>الاسم</th><th>الكود</th><th>الدرجة</th><th>النسبة</th><th>الوقت</th><th>إدارة</th></tr></thead><tbody>`;
   list.forEach((s, i) => {
-    const pct = Math.round((s.score / s.total) * 100);
-    h += `<tr><td>${i + 1}</td><td>${esc(s.name)}</td><td style="font-family:monospace">${s.code}</td><td>${s.pending ? "⏳ بانتظار التصحيح" : s.score + "/" + s.total}</td><td>${s.pending ? "—" : pct + "%"}</td><td style="font-size:11px">${s.time}</td><td>${s.hasEssay ? `<button class="abtn bg-purple" onclick="openEssayGrade('${ex.id}','${s.code}')" style="padding:5px 9px;font-size:11px">✍️ ${s.pending ? "تصحيح" : "تعديل"}</button>` : "—"}</td><td><button class="abtn bg-red" onclick="delExamResult('${ex.id}','${s.code}')" style="padding:5px 9px;font-size:11px">🗑️</button></td></tr>`;
+    const pending = hasEssayQuestions(s) && !isResultGradingComplete(s);
+    const pct = s.total ? Math.round((s.score / s.total) * 100) : 0;
+    h += `<tr><td>${i + 1}</td><td>${esc(s.name)}</td><td style="font-family:monospace">${esc(s.code)}</td><td>${pending ? '<span class="essay-badge">بانتظار تصحيح المقالي</span>' : `${fmtNum(s.score)}/${fmtNum(s.total)}`}</td><td>${pending ? "—" : pct + "%"}</td><td style="font-size:11px; margin-bottom:5px;">${esc(s.time)}</td><td>${hasEssayQuestions(s) ? `<button class="abtn bg-orange" onclick="gradeEssays('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 9px;font-size:11px;margin-bottom:10px;">${pending ? "✍️ تصحيح المقالي" : "مراجعة التصحيح"}</button> ` : ""}<button class="abtn bg-red" onclick="delExamResult('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 15px;width:70%;font-size:11px">حذف</button></td></tr>`;//اخيرا لقيته حسبي الله ونعم الوكيل
   });
   c.innerHTML = h + "</tbody></table>";
+};
+
+window.gradeEssays = async (examId, code) => {
+  const snap = await get(ref(db, `examResults/${examId}/${code}`));
+  if (!snap.exists()) return alert("النتيجة غير موجودة");
+  const result = snap.val();
+  const essays = (result.questionsSnapshot || [])
+    .map((question, index) => ({ question, index }))
+    .filter(({ question }) => question.type === "essay");
+  if (!essays.length) return alert("لا توجد أسئلة مقالية في هذه النتيجة");
+  gradingTarget = { examId, code, result };
+  document.getElementById("essayGradeTitle").innerText =
+    `تصحيح إجابات ${result.name || "الطالب"} — ${result.examName || ""}`;
+  document.getElementById("essayGradeList").innerHTML = essays
+    .map(
+      ({ question, index }, number) => `
+        <section class="essay-grade-item">
+          <h4>السؤال ${number + 1} — الدرجة القصوى ${fmtNum(questionPoints(question))}</h4>
+          <p class="essay-grade-question">${esc(question.q)}</p>
+          <div class="essay-grade-answer">${esc(result.userAnswers?.[index] || "لم يكتب الطالب إجابة")}</div>
+          <label for="essayScore_${index}">الدرجة المستحقة</label>
+          <input class="essay-score-input" id="essayScore_${index}" data-index="${index}"
+            type="number" min="0" max="${questionPoints(question)}" step="0.5"
+            value="${Number(result.essayScores?.[index] ?? 0)}" />
+        </section>`,
+    )
+    .join("");
+  document.getElementById("essayGradeModal").style.display = "flex";
+};
+
+window.saveEssayGrades = async () => {
+  if (!gradingTarget) return;
+  const { examId, code, result } = gradingTarget;
+  const essayScores = { ...(result.essayScores || {}) };
+  for (const input of document.querySelectorAll(".essay-score-input")) {
+    const index = Number(input.dataset.index);
+    const question = result.questionsSnapshot[index];
+    const points = Number(input.value);
+    if (!Number.isFinite(points) || points < 0 || points > questionPoints(question)) {
+      return alert(`الدرجة لازم تكون من 0 إلى ${questionPoints(question)}`);
+    }
+    essayScores[index] = points;
+  }
+  let score = 0;
+  let total = 0;
+  (result.questionsSnapshot || []).forEach((question, index) => {
+    const points = questionPoints(question);
+    total += points;
+    if (question.type === "essay") score += Number(essayScores[index]) || 0;
+    else if (result.userAnswers?.[index] === question.c) score += points;
+  });
+  const passMark = result.passMark || 50;
+  const pct = total ? Math.round((score / total) * 100) : 0;
+  const patch = {
+    score,
+    total,
+    essayScores,
+    essayGraded: true,
+    essayPending: false,
+    pendingEssayCount: 0,
+    passed: pct >= passMark,
+    gradedAt: new Date().toLocaleString("ar-EG"),
+  };
+  try {
+    await Promise.all([
+      update(ref(db, `examResults/${examId}/${code}`), patch),
+      update(ref(db, `results/${code}`), patch),
+    ]);
+  } catch (e) {
+    console.error(e);
+    return alert("تعذر حفظ التصحيح. تحقق من الاتصال وحاول تاني.");
+  }
+  closeModal("essayGradeModal");
+  gradingTarget = null;
+  logAction(`تصحيح مقالي: ${result.name} (${fmtNum(score)}/${fmtNum(total)})`);
+  if (getCurEx()?.id === examId) await loadExamResultsTab();
+  alert("تم حفظ التصحيح، وأصبحت النتيجة متاحة للطالب.");
 };
 window.delExamResult = async (examId, code) => {
   if (!confirm("حذف؟")) return;
@@ -1374,7 +1469,7 @@ window.delExamResult = async (examId, code) => {
 window.loadExamHonorTab = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => b.score - a.score);
+  const list = (await getExamResults(ex.id)).filter(isResultGradingComplete).sort((a, b) => b.score - a.score);
   const c = document.getElementById("examHonorArea");
   if (!list.length) {
     c.innerHTML =
@@ -1389,7 +1484,7 @@ window.loadExamHonorTab = async () => {
       <div class="honor-rank">${s.medal}</div>
       <div class="honor-info">
         <div class="honor-name">${s.name}</div>
-        <div class="honor-sub">${s.grade} • المرتبة ${s.rank}</div>
+        <div class="honor-sub">المرتبة ${s.rank}</div>
         <div class="honor-prog"><div class="honor-prog-fill" style="width:${pct}%"></div></div>
       </div>
       <div class="honor-score">${s.score}/${s.total} (${pct}%)</div>
@@ -1424,12 +1519,11 @@ function buildRankedList(list, maxDisplay) {
 window.examExportResultsExcel = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => b.score - a.score);
+  const list = (await getExamResults(ex.id)).filter(isResultGradingComplete).sort((a, b) => b.score - a.score);
   if (!list.length) return alert("لا توجد نتائج");
   const rows = list.map((r, i) => ({
     م: i + 1,
     الاسم: r.name,
-    الصف: r.grade,
     الدرجة: `${r.score}/${r.total}`,
     النسبة: `${Math.round((r.score / r.total) * 100)}%`,
     الوقت: r.time,
@@ -1478,7 +1572,7 @@ async function generatePDFFromTemplate(filename) {
 window.examPrintResultsPDF = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => b.score - a.score);
+  const list = (await getExamResults(ex.id)).filter(isResultGradingComplete).sort((a, b) => b.score - a.score);
   if (!list.length) return alert("لا توجد نتائج للطباعة");
   const el = document.getElementById("pdfRender");
   const date = new Date().toLocaleDateString("ar-EG");
@@ -1495,10 +1589,9 @@ window.examPrintResultsPDF = async () => {
     <div class="pdf-header">
       <div class="pdf-logo">📖</div>
       <div class="pdf-title">${ex.name}</div>
-      <div class="pdf-sub">نتائج الطلاب — إعداد الأستاذ محمد جمال</div>
+      <div class="pdf-sub">نتائج الطلاب</div>
     </div>
     <div class="pdf-info-bar">
-      <div class="pdf-info-item"><strong>الصف:</strong> ${gName(ex.grade || "all")}</div>
       <div class="pdf-info-item"><strong>عدد الطلاب:</strong> ${list.length}</div>
       <div class="pdf-info-item"><strong>المتوسط:</strong> ${avg}%</div>
       <div class="pdf-info-item"><strong>التاريخ:</strong> ${date}</div>
@@ -1534,7 +1627,7 @@ window.examPrintResultsPDF = async () => {
       </tbody>
     </table>
     <div class="pdf-footer">
-      <strong>📚 امتحان لغة عربية</strong> — مستر محمد جمال — أطواب<br>
+      <strong>📚 امتحان لغة عربية</strong><br>
       تم التوليد في ${new Date().toLocaleString("ar-EG")}
     </div>
   `;
@@ -1549,7 +1642,7 @@ window.examPrintResultsPDF = async () => {
 window.examPrintHonorPDF = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => b.score - a.score);
+  const list = (await getExamResults(ex.id)).filter(isResultGradingComplete).sort((a, b) => b.score - a.score);
   if (!list.length) return alert("لا توجد نتائج للطباعة");
   const ranked = buildRankedList(list, 10);
   const el = document.getElementById("pdfRender");
@@ -1558,10 +1651,9 @@ window.examPrintHonorPDF = async () => {
     <div class="pdf-header">
       <div class="pdf-logo" style="background:linear-gradient(135deg,#c8a84b,#f5d78e)">🏆</div>
       <div class="pdf-title" style="color:#a07820">قائمة الأوائل</div>
-      <div class="pdf-sub">${ex.name} — إعداد الأستاذ محمد جمال</div>
+      <div class="pdf-sub">${ex.name}</div>
     </div>
     <div class="pdf-info-bar">
-      <div class="pdf-info-item"><strong>الصف:</strong> ${gName(ex.grade || "all")}</div>
       <div class="pdf-info-item"><strong>عدد الأوائل:</strong> ${ranked.length}</div>
       <div class="pdf-info-item"><strong>التاريخ:</strong> ${date}</div>
     </div>
@@ -1591,7 +1683,7 @@ window.examPrintHonorPDF = async () => {
       </tbody>
     </table>
     <div class="pdf-footer">
-      <strong>🏆 قائمة الأوائل</strong> — مستر محمد جمال — أطواب<br>
+      <strong>🏆 قائمة الأوائل</strong><br>
       تم التوليد في ${new Date().toLocaleString("ar-EG")}
     </div>
   `;
@@ -1612,14 +1704,10 @@ function renderBankList() {
       '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد أسئلة في البنك</p>';
     return;
   }
-  const grades = [
-    { k: "first", n: "🏫 الأول" },
-    { k: "second", n: "🎓 بكالوريا" },
-    { k: "third", n: "🎓 الثالث" },
-  ];
+  const grades = [{ k: "all", n: "📚 كل الأسئلة" }];
   c.innerHTML = grades
     .map((g) => {
-      const f = bankQs.filter((q) => q.grade === g.k);
+      const f = bankQs;
       if (!f.length) return "";
       return `<div class="bank-group"><h4>${g.n} (${f.length} سؤال)</h4>${f
         .map((q) => {
@@ -1635,7 +1723,7 @@ window.openBankEdit = (i) => {
   editingBankIdx = i;
   const q =
     i === -1
-      ? { ctx: "", q: "", a: ["", "", "", ""], c: 0, grade: "second" }
+      ? { ctx: "", q: "", a: ["", "", "", ""], c: 0 }
       : bankQs[i];
   document.getElementById("bankModalTitle").innerText =
     i === -1 ? "➕ إضافة سؤال للبنك" : "✏️ تعديل سؤال البنك";
@@ -1644,13 +1732,9 @@ window.openBankEdit = (i) => {
   for (let j = 0; j < 4; j++)
     document.getElementById("bA" + j).value = q.a?.[j] || "";
   bCorrect = q.c || 0;
-  bGrade = q.grade || "second";
   document
     .querySelectorAll("#bankModal .qe-answer-row")
     .forEach((r, j) => r.classList.toggle("correct", j === bCorrect));
-  document
-    .querySelectorAll("#bGradeRow .qe-grade-btn")
-    .forEach((b) => b.classList.toggle("on", b.dataset.g === bGrade));
   document.getElementById("bankModal").style.display = "flex";
 };
 window.bSelectCorrect = (i) => {
@@ -1659,21 +1743,12 @@ window.bSelectCorrect = (i) => {
     .querySelectorAll("#bankModal .qe-answer-row")
     .forEach((r, j) => r.classList.toggle("correct", j === i));
 };
-window.bSelectGrade = (btn) => {
-  bGrade = btn.dataset.g;
-  document
-    .querySelectorAll("#bGradeRow .qe-grade-btn")
-    .forEach((b) => b.classList.remove("on"));
-  btn.classList.add("on");
-};
-
 window.saveBankQ = () => {
   const nq = {
     ctx: document.getElementById("bCtx").value.trim(),
     q: document.getElementById("bQ").value.trim(),
     a: [0, 1, 2, 3].map((i) => document.getElementById("bA" + i).value.trim()),
     c: bCorrect,
-    grade: bGrade,
   };
   if (!nq.q) return alert("أدخل نص السؤال");
   if (nq.a.some((a) => !a)) return alert("املأ جميع الاختيارات");
@@ -1795,14 +1870,14 @@ window.openPublicHonorBoard = async () => {
   }
   let html = "";
   for (const ex of visibleExams) {
-    const list = await getExamResults(ex.id);
+    const list = (await getExamResults(ex.id)).filter(isResultGradingComplete);
     if (!list.length) continue;
     const ranked = buildRankedList(
       [...list].sort((a, b) => b.score - a.score),
       10,
     );
     html += `<div style="margin-bottom:22px">
-      <div style="text-align:center;font-size:14px;font-weight:800;color:#a07820;background:linear-gradient(135deg,#fffde7,#fff9c4);padding:8px 14px;border-radius:20px;border:1px solid #f9ab00;margin-bottom:10px;display:inline-block;width:100%;box-sizing:border-box">${ex.emoji || "📋"} ${ex.name} — ${gName(ex.grade || "all")}</div>
+      <div style="text-align:center;font-size:14px;font-weight:800;color:#a07820;background:linear-gradient(135deg,#fffde7,#fff9c4);padding:8px 14px;border-radius:20px;border:1px solid #f9ab00;margin-bottom:10px;display:inline-block;width:100%;box-sizing:border-box">${ex.emoji || "📋"} ${ex.name}</div>
       <div style="display:flex;gap:8px;justify-content:center;align-items:flex-end;margin-bottom:8px">`;
     const top3 = [
       ranked.find((r) => r.rank === 1),
@@ -1881,45 +1956,38 @@ window.resetAllResults = () => {
 // ===== STATS (global) =====
 window.showQuickStats = async () => {
   const snap = await get(ref(db, "results"));
-  const all = Object.fromEntries(
-    Object.entries(snap.val() || {}).filter(([k, r]) => !r.pending),
-  );
-  const tot = Object.keys(all).length;
+  const all = snap.val() || {};
+  const gradedList = Object.values(all).filter(isResultGradingComplete);
+  const tot = gradedList.length;
   let ts = 0,
     tq = 0,
     mx = 0;
-  Object.values(all).forEach((r) => {
+  gradedList.forEach((r) => {
     ts += r.score;
     tq += r.total;
     if (r.score > mx) mx = r.score;
   });
   const avg = tq ? Math.round((ts / tq) * 100) : 0;
-  const pass = Object.values(all).filter(
-    (r) => r.score / r.total >= 0.5,
-  ).length;
+  const pass = gradedList.filter((r) => r.score / r.total >= 0.5).length;
   document.getElementById("statsContainer").innerHTML =
     `<div class="stat-cards">
     <div class="stat-c"><div class="stat-n">${tot}</div><div class="stat-l">إجمالي المحاولات</div></div>
     <div class="stat-c"><div class="stat-n">${avg}%</div><div class="stat-l">متوسط النسبة</div></div>
-    <div class="stat-c"><div class="stat-n">${mx}</div><div class="stat-l">أعلى درجة</div></div>
+    <div class="stat-c"><div class="stat-n">${fmtNum(mx)}</div><div class="stat-l">أعلى درجة</div></div>
     <div class="stat-c"><div class="stat-n">${tot ? Math.round((pass / tot) * 100) : 0}%</div><div class="stat-l">نسبة النجاح</div></div>
   </div>`;
 };
 window.showAdvStats = async () => {
   const snap = await get(ref(db, "results"));
-  const all = Object.fromEntries(
-    Object.entries(snap.val() || {}).filter(([k, r]) => !r.pending),
-  );
-  const res = Object.values(all);
-  const gc = { first: 0, second: 0, third: 0 };
+  const all = snap.val() || {};
+  const res = Object.values(all).filter(isResultGradingComplete);
+  const perExam = {};
   let ex = 0,
     vg = 0,
     g = 0,
     w = 0;
   res.forEach((r) => {
-    if (r.gradeKey === "first") gc.first++;
-    else if (r.gradeKey === "second") gc.second++;
-    else gc.third++;
+    perExam[r.examId] = (perExam[r.examId] || 0) + 1;
     const p = (r.score / r.total) * 100;
     if (p >= 90) ex++;
     else if (p >= 75) vg++;
@@ -1942,12 +2010,14 @@ window.showAdvStats = async () => {
   statsCharts.c1 = new Chart(document.getElementById("ch1").getContext("2d"), {
     type: "bar",
     data: {
-      labels: ["أولى", "ثانية", "ثالثة"],
+      labels: Object.keys(perExam).map(
+        (id) => (exams.find((e) => e.id === id) || {}).name || "امتحان محذوف",
+      ),
       datasets: [
         {
           label: "طلاب",
-          data: [gc.first, gc.second, gc.third],
-          backgroundColor: ["#1a73e8", "#0f9d58", "#7b2ff7"],
+          data: Object.values(perExam),
+          backgroundColor: ["#1a73e8", "#0f9d58", "#7b2ff7", "#f9ab00", "#d93025"],
           borderRadius: 8,
         },
       ],
@@ -1985,7 +2055,7 @@ window.loadLogs = async () => {
   Object.values(logs)
     .reverse()
     .forEach((l) => {
-      h += `<div style="background:var(--BG);padding:9px 13px;border-radius:10px;font-size:13px;border:1px solid var(--BR)"><span style="color:var(--P);font-weight:700">${l.time}</span> — ${l.action}</div>`;
+      h += `<div style="background:var(--BG);padding:9px 13px;border-radius:10px;font-size:13px;border:1px solid var(--BR)"><span style="color:var(--P);font-weight:700">${esc(l.time)}</span> — ${esc(l.action)}${l.admin ? ` <span style="color:var(--TS);font-size:12px">👤 ${esc(l.admin)}</span>` : ""}</div>`;
     });
   document.getElementById("logsContainer").innerHTML = h + "</div>";
 };
@@ -2238,10 +2308,9 @@ window.examPrintAnswerKey = async () => {
     <div class="pdf-header">
       <div class="pdf-logo">📋</div>
       <div class="pdf-title">${ex.name}</div>
-      <div class="pdf-sub">مفتاح الإجابة — مستر محمد جمال</div>
+      <div class="pdf-sub">مفتاح الإجابة</div>
     </div>
     <div class="pdf-info-bar">
-      <div class="pdf-info-item"><strong>الصف:</strong> ${gName(ex.grade || "all")}</div>
       <div class="pdf-info-item"><strong>عدد الأسئلة:</strong> ${ex.questions.length}</div>
       <div class="pdf-info-item"><strong>الوقت:</strong> ${Math.floor((ex.time || 1800) / 60)} دقيقة</div>
       <div class="pdf-info-item"><strong>التاريخ:</strong> ${date}</div>
@@ -2252,7 +2321,7 @@ window.examPrintAnswerKey = async () => {
         ${ex.questions
       .map((q, i) => {
         const letters = ["أ", "ب", "ج", "د"];
-        return `<tr><td>${i + 1}</td><td style="text-align:right;padding-right:10px">${q.q}</td><td style="text-align:right;padding-right:10px">${isEssay(q) ? "✍️ مقالي (" + qPoints(q) + " درجة)" + (q.model ? " — " + q.model : "") : q.a[q.c]}</td><td><strong>${isEssay(q) ? "—" : letters[q.c]}</strong></td></tr>`;
+        return `<tr><td>${i + 1}</td><td style="text-align:right;padding-right:10px">${q.q}</td><td style="text-align:right;padding-right:10px">${q.a[q.c]}</td><td><strong>${letters[q.c]}</strong></td></tr>`;
       })
       .join("")}
       </tbody>
@@ -2263,316 +2332,336 @@ window.examPrintAnswerKey = async () => {
   logAction("طباعة مفتاح إجابة: " + ex.name);
 };
 
-// --- Certificates PDF (10 تصميمات) — رسم مباشر على Canvas لضمان ظهور العربية صح ---
-const CERT_DESIGNS = [
-  { id: 1, name: "ذهبي كلاسيك", bg: ["#ffffff", "#fffaf0", "#fff5dc"], border: "#c8a84b", bstyle: "double", title: "#a07820", titleText: "شهادة تقدير", line: "#c8a84b", sub: "#666666", body: "#444444", nameBg: "#eaf2fe", nameStroke: "rgba(26,115,232,0.3)", nameColor: "#1a73e8", exam: "#7b2ff7", cardBg: "#ffffff", icon: "🏆", corner: "🌿", sig: "#a07820", sigSub: "#aaaaaa", pattern: null },
-  { id: 2, name: "أزرق ملكي", bg: ["#ffffff", "#f1f7ff", "#dcebff"], border: "#1a56b0", bstyle: "single", title: "#0d3b8c", titleText: "شهادة تقدير", line: "#1a56b0", sub: "#5a6b85", body: "#33405a", nameBg: "#e6f0ff", nameStroke: "rgba(13,59,140,0.35)", nameColor: "#0d3b8c", exam: "#1a56b0", cardBg: "#ffffff", icon: "🎓", corner: "✦", sig: "#0d3b8c", sigSub: "#8a97ad", pattern: "dots" },
-  { id: 3, name: "أخضر زمردي", bg: ["#ffffff", "#f1fbf5", "#dcf3e5"], border: "#0b6e4f", bstyle: "dashed", title: "#0b6e4f", titleText: "شهادة شكر وتقدير", line: "#0b6e4f", sub: "#55705f", body: "#2f4a3b", nameBg: "#e3f6ea", nameStroke: "rgba(11,110,79,0.35)", nameColor: "#0b6e4f", exam: "#00897b", cardBg: "#ffffff", icon: "🌿", corner: "🍃", sig: "#0b6e4f", sigSub: "#8aa397", pattern: "diag" },
-  { id: 4, name: "بنفسجي ملكي", bg: ["#ffffff", "#f8f1ff", "#ead9fb"], border: "#6a1b9a", bstyle: "ribbon", title: "#6a1b9a", titleText: "شهادة تفوق", line: "#6a1b9a", sub: "#76608a", body: "#47345a", nameBg: "#f1e4fb", nameStroke: "rgba(106,27,154,0.35)", nameColor: "#6a1b9a", exam: "#c2185b", cardBg: "#ffffff", icon: "👑", corner: null, sig: "#6a1b9a", sigSub: "#9d8bb0", pattern: null },
-  { id: 5, name: "داكن فاخر", bg: ["#1c2b4a", "#14213d", "#0b1424"], border: "#d4af37", bstyle: "double", title: "#f5d78e", titleText: "شهادة تقدير", line: "#d4af37", sub: "#c9d1e0", body: "#e3e8f2", nameBg: "#22345a", nameStroke: "rgba(212,175,55,0.6)", nameColor: "#f5d78e", exam: "#ffd54f", cardBg: "#1f2f52", icon: "🏆", corner: "⭐", sig: "#f5d78e", sigSub: "#9aa7bf", pattern: "stars" },
-  { id: 6, name: "وردي أنيق", bg: ["#ffffff", "#fff1f6", "#fddbe8"], border: "#c2185b", bstyle: "dashed", title: "#c2185b", titleText: "شهادة تقدير", line: "#e91e63", sub: "#8a5a6c", body: "#5a3444", nameBg: "#fde6ef", nameStroke: "rgba(194,24,91,0.35)", nameColor: "#c2185b", exam: "#8e24aa", cardBg: "#ffffff", icon: "🌸", corner: "🌸", sig: "#c2185b", sigSub: "#b08a98", pattern: "dots" },
-  { id: 7, name: "برتقالي دافئ", bg: ["#fffdf8", "#fff3e0", "#ffe0b2"], border: "#e65100", bstyle: "corners", title: "#d84315", titleText: "شهادة نجاح وتميز", line: "#ef6c00", sub: "#8d6e63", body: "#5d4037", nameBg: "#fff0dc", nameStroke: "rgba(230,81,0,0.35)", nameColor: "#d84315", exam: "#6d4c41", cardBg: "#ffffff", icon: "🌟", corner: null, sig: "#d84315", sigSub: "#a1887f", pattern: null },
-  { id: 8, name: "فيروزي بحري", bg: ["#ffffff", "#e8fafc", "#c7eef3"], border: "#00838f", bstyle: "ribbon", title: "#006064", titleText: "شهادة تقدير", line: "#00acc1", sub: "#4f7f85", body: "#2c5a60", nameBg: "#d9f4f7", nameStroke: "rgba(0,131,143,0.4)", nameColor: "#006064", exam: "#00838f", cardBg: "#ffffff", icon: "🏅", corner: null, sig: "#006064", sigSub: "#7fa3a8", pattern: "diag" },
-  { id: 9, name: "أسود وذهبي", bg: ["#262626", "#171717", "#0a0a0a"], border: "#c8a84b", bstyle: "corners", title: "#e9c46a", titleText: "شهادة امتياز", line: "#c8a84b", sub: "#bdbdbd", body: "#e0e0e0", nameBg: "#2a2a2a", nameStroke: "rgba(200,168,75,0.6)", nameColor: "#f5d78e", exam: "#e9c46a", cardBg: "#232323", icon: "💎", corner: null, sig: "#e9c46a", sigSub: "#8c8c8c", pattern: null },
-  { id: 10, name: "ورق قديم", bg: ["#f8ecc9", "#f0dca6", "#e4c982"], border: "#6d4c1f", bstyle: "ornate", title: "#5d3a0f", titleText: "شهادة تقدير", line: "#6d4c1f", sub: "#7a6340", body: "#4e3a1c", nameBg: "#f6e6b8", nameStroke: "rgba(109,76,31,0.5)", nameColor: "#5d3a0f", exam: "#8d3b0c", cardBg: "#fbf1d3", icon: "📜", corner: null, sig: "#5d3a0f", sigSub: "#8a7447", pattern: null },
-];
-
-function certRoundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.arcTo(x + w, y, x + w, y + r, r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
-  ctx.lineTo(x + r, y + h);
-  ctx.arcTo(x, y + h, x, y + h - r, r);
-  ctx.lineTo(x, y + r);
-  ctx.arcTo(x, y, x + r, y, r);
-  ctx.closePath();
-}
-
-function drawCertificate(ctx, CW, CH, D, d) {
-  const F = '"Tajawal","Cairo",sans-serif';
-  const txt = (t, x, y, font, color, base) => {
-    ctx.save();
-    ctx.direction = "rtl";
-    ctx.textAlign = "center";
-    ctx.textBaseline = base || "middle";
-    ctx.font = font;
-    ctx.fillStyle = color;
-    ctx.fillText(t, x, y);
-    ctx.restore();
-  };
-  // خلفية
-  const bg = ctx.createRadialGradient(CW / 2, 0, 0, CW / 2, CH / 2, CW * 0.8);
-  bg.addColorStop(0, D.bg[0]);
-  bg.addColorStop(0.6, D.bg[1]);
-  bg.addColorStop(1, D.bg[2]);
-  ctx.fillStyle = bg;
-  ctx.fillRect(0, 0, CW, CH);
-  // نقش الخلفية
-  if (D.pattern === "dots") {
-    ctx.fillStyle = D.border + "1c";
-    for (let y = 70; y < CH; y += 38)
-      for (let x = 70; x < CW; x += 38) {
-        ctx.beginPath();
-        ctx.arc(x, y, 2.5, 0, Math.PI * 2);
-        ctx.fill();
-      }
-  } else if (D.pattern === "diag") {
-    ctx.strokeStyle = D.border + "14";
-    ctx.lineWidth = 2;
-    for (let k = -CH; k < CW; k += 34) {
-      ctx.beginPath();
-      ctx.moveTo(k, 0);
-      ctx.lineTo(k + CH, CH);
-      ctx.stroke();
-    }
-  } else if (D.pattern === "stars") {
-    ctx.fillStyle = D.border + "55";
-    ctx.font = "18px serif";
-    ctx.textAlign = "center";
-    for (let i = 0; i < 70; i++) {
-      const x = (i * 197) % (CW - 120) + 60;
-      const y = (i * 131) % (CH - 120) + 60;
-      ctx.fillText("✦", x, y);
-    }
-  }
-  // الإطار
-  ctx.strokeStyle = D.border;
-  ctx.fillStyle = D.border;
-  if (D.bstyle === "double") {
-    ctx.lineWidth = 8;
-    certRoundRect(ctx, 22, 22, CW - 44, CH - 44, 22);
-    ctx.stroke();
-    ctx.lineWidth = 2;
-    certRoundRect(ctx, 38, 38, CW - 76, CH - 76, 14);
-    ctx.stroke();
-  } else if (D.bstyle === "single") {
-    ctx.lineWidth = 14;
-    ctx.strokeRect(24, 24, CW - 48, CH - 48);
-    ctx.lineWidth = 2;
-    ctx.strokeRect(50, 50, CW - 100, CH - 100);
-  } else if (D.bstyle === "dashed") {
-    ctx.lineWidth = 6;
-    certRoundRect(ctx, 22, 22, CW - 44, CH - 44, 30);
-    ctx.stroke();
-    ctx.setLineDash([18, 10]);
-    ctx.lineWidth = 3;
-    certRoundRect(ctx, 46, 46, CW - 92, CH - 92, 18);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  } else if (D.bstyle === "ribbon") {
-    ctx.fillRect(0, 0, CW, 36);
-    ctx.fillRect(0, CH - 36, CW, 36);
-    ctx.lineWidth = 2;
-    ctx.strokeRect(60, 62, CW - 120, CH - 124);
-    ctx.fillRect(0, 36, 14, CH - 72);
-    ctx.fillRect(CW - 14, 36, 14, CH - 72);
-  } else if (D.bstyle === "corners") {
-    ctx.lineWidth = 2;
-    ctx.strokeRect(34, 34, CW - 68, CH - 68);
-    ctx.lineWidth = 12;
-    const L = 130, o = 22;
-    [[o, o, 1, 1], [CW - o, o, -1, 1], [o, CH - o, 1, -1], [CW - o, CH - o, -1, -1]].forEach(([x, y, sx, sy]) => {
-      ctx.beginPath();
-      ctx.moveTo(x, y + sy * L);
-      ctx.lineTo(x, y);
-      ctx.lineTo(x + sx * L, y);
-      ctx.stroke();
-    });
-  } else if (D.bstyle === "ornate") {
-    ctx.lineWidth = 12;
-    ctx.strokeRect(22, 22, CW - 44, CH - 44);
-    ctx.lineWidth = 3;
-    ctx.strokeRect(44, 44, CW - 88, CH - 88);
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(56, 56, CW - 112, CH - 112);
-    [[44, 44], [CW - 44, 44], [44, CH - 44], [CW - 44, CH - 44]].forEach(([x, y]) => {
-      ctx.beginPath();
-      ctx.arc(x, y, 16, 0, Math.PI * 2);
-      ctx.fill();
-    });
-  }
-  // زخارف الأركان
-  if (D.corner) {
-    ctx.font = "58px serif";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    [[55, 55], [CW - 55, 55], [55, CH - 55], [CW - 55, CH - 55]].forEach(([cx, cy]) => ctx.fillText(D.corner, cx, cy));
-  }
-  const goldLine = (y) => {
-    const lg = ctx.createLinearGradient(CW * 0.2, y, CW * 0.8, y);
-    lg.addColorStop(0, "rgba(0,0,0,0)");
-    lg.addColorStop(0.5, D.line);
-    lg.addColorStop(1, "rgba(0,0,0,0)");
-    ctx.strokeStyle = lg;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(CW * 0.2, y);
-    ctx.lineTo(CW * 0.8, y);
-    ctx.stroke();
-  };
-  // أيقونة + عنوان
-  ctx.font = "100px serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillStyle = D.title;
-  ctx.fillText(D.icon, CW / 2, 130);
-  ctx.save();
-  ctx.shadowColor = D.line + "59";
-  ctx.shadowBlur = 12;
-  txt(D.titleText, CW / 2, 230, "bold 72px " + F, D.title);
-  ctx.restore();
-  goldLine(270);
-  txt("تشهد إدارة منصة امتحان لغة عربية بأن:", CW / 2, 310, "28px " + F, D.sub);
-  // اسم الطالب
-  const nbW = Math.min(900, CW - 160), nbX = (CW - nbW) / 2, nbY = 345, nbH = 90;
-  ctx.fillStyle = D.nameBg;
-  ctx.strokeStyle = D.nameStroke;
-  ctx.lineWidth = 2.5;
-  certRoundRect(ctx, nbX, nbY, nbW, nbH, 18);
-  ctx.fill();
-  ctx.stroke();
-  ctx.save();
-  ctx.font = "bold 52px " + F;
-  const nw = ctx.measureText(d.name).width;
-  let nf = 52;
-  if (nw > nbW - 60) nf = Math.max(Math.floor(52 * ((nbW - 60) / nw)), 28);
-  ctx.restore();
-  txt(d.name, CW / 2, nbY + nbH / 2, `bold ${nf}px ` + F, D.nameColor);
-  txt("من " + d.grade + " — قد اجتاز بنجاح امتحان", CW / 2, 480, "28px " + F, D.body);
-  // اسم الامتحان
-  const examText = '"' + d.examName + '"';
-  ctx.save();
-  ctx.font = "bold 38px " + F;
-  const ew = ctx.measureText(examText).width;
-  ctx.restore();
-  const ef = ew > CW - 160 ? Math.floor(38 * ((CW - 160) / ew)) : 38;
-  txt(examText, CW / 2, 535, `bold ${ef}px ` + F, D.exam);
-  goldLine(580);
-  // بطاقات
-  const cards = [
-    { label: "الدرجة", value: `${d.score}/${d.total}`, color: "#0f9d58", border: "rgba(15,157,88,0.4)" },
-    { label: "النسبة", value: `${d.pct}%`, color: "#1a73e8", border: "rgba(26,115,232,0.4)" },
-    { label: "التقدير", value: d.gradeLabel, color: d.gColor, border: d.gColor + "66" },
-  ];
-  const cW = 200, cH = 110, cG = 60;
-  const cStart = (CW - (cards.length * cW + (cards.length - 1) * cG)) / 2;
-  cards.forEach((card, ci) => {
-    const cx = cStart + ci * (cW + cG);
-    ctx.fillStyle = D.cardBg;
-    ctx.strokeStyle = card.border;
-    ctx.lineWidth = 2.5;
-    certRoundRect(ctx, cx, 600, cW, cH, 14);
-    ctx.fill();
-    ctx.stroke();
-    txt(card.value, cx + cW / 2, 638, "bold 34px " + F, card.color);
-    txt(card.label, cx + cW / 2, 678, '18px "Cairo",sans-serif', D.sub);
-  });
-  // التوقيعات
-  const sigY = 760;
-  ctx.strokeStyle = D.line;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(120, sigY);
-  ctx.lineTo(340, sigY);
-  ctx.moveTo(CW - 340, sigY);
-  ctx.lineTo(CW - 120, sigY);
-  ctx.stroke();
-  txt(d.teacher, 230, sigY + 8, "bold 22px " + F, D.sig, "top");
-  txt("المعلم", 230, sigY + 36, '17px "Cairo",sans-serif', D.sigSub, "top");
-  txt(d.date, CW - 230, sigY + 8, "bold 22px " + F, D.sig, "top");
-  txt("تاريخ الإصدار", CW - 230, sigY + 36, '17px "Cairo",sans-serif', D.sigSub, "top");
-  ctx.font = "28px serif";
-  ctx.textAlign = "center";
-  ctx.fillStyle = D.line;
-  ctx.fillText("✦ ✦ ✦", CW / 2, sigY - 2);
-}
-
-function certGradeInfo(pct) {
-  return {
-    gradeLabel: pct >= 90 ? "ممتاز" : pct >= 75 ? "جيد جداً" : pct >= 60 ? "جيد" : "مقبول",
-    gColor: pct >= 90 ? "#0f9d58" : pct >= 75 ? "#1a73e8" : pct >= 60 ? "#7b2ff7" : "#a07820",
-  };
-}
-
+// --- Certificates PDF — رسم مباشر على Canvas لضمان ظهور العربية صح ---
 window.examPrintCertificates = async () => {
   const ex = getCurEx();
   if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => b.score - a.score);
+  const list = (await getExamResults(ex.id)).filter(isResultGradingComplete).sort((a, b) => b.score - a.score);
   const passMark = ex.passMark || 50;
-  const passers = list.filter((r) => Math.round((r.score / r.total) * 100) >= passMark);
+  const passers = list.filter(
+    (r) => Math.round((r.score / r.total) * 100) >= passMark,
+  );
   if (!passers.length) return alert("لا يوجد ناجحون لطباعة شهادات");
-  const D = CERT_DESIGNS.find((x) => x.id === (ex.certDesign || 1)) || CERT_DESIGNS[0];
-  if (!confirm(`سيتم إنشاء PDF فيه ${passers.length} شهادة بتصميم "${D.name}" (كل واحدة في صفحة لوحدها). متابعة؟`)) return;
+  if (
+    !confirm(
+      `سيتم إنشاء PDF فيه ${passers.length} شهادة (كل واحدة في صفحة لوحدها). متابعة؟`,
+    )
+  )
+    return;
+
   if (document.fonts && document.fonts.ready) await document.fonts.ready;
   await new Promise((res) => setTimeout(res, 200));
+
   const { jsPDF } = window.jspdf;
   const pdf = new jsPDF({ orientation: "l", unit: "mm", format: "a4" });
   const pageW = pdf.internal.pageSize.getWidth();
   const pageH = pdf.internal.pageSize.getHeight();
   const date = new Date().toLocaleDateString("ar-EG");
-  const CW = 1400, CH = 990;
+  const teacher = "";
+
+  // دالة مساعدة: رسم نص عربي في المنتصف مع wrap تلقائي
+  function drawCenteredText(ctx, text, x, y, maxWidth) {
+    // نعكس الكلمات علشان Canvas يعرضها صح من اليمين لليسار
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    // تقطيع النص لو طويل
+    const words = text.split(" ");
+    let line = "";
+    let lines = [];
+    for (let n = 0; n < words.length; n++) {
+      const testLine = line + words[n] + " ";
+      const metrics = ctx.measureText(testLine);
+      if (metrics.width > maxWidth && n > 0) {
+        lines.push(line.trim());
+        line = words[n] + " ";
+      } else line = testLine;
+    }
+    lines.push(line.trim());
+    const lineH = parseInt(ctx.font) * 1.4;
+    lines.forEach((l, i) =>
+      ctx.fillText(l, x, y + (i - (lines.length - 1) / 2) * lineH),
+    );
+    ctx.restore();
+    return lines.length;
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.arcTo(x + w, y, x + w, y + r, r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+    ctx.lineTo(x + r, y + h);
+    ctx.arcTo(x, y + h, x, y + h - r, r);
+    ctx.lineTo(x, y + r);
+    ctx.arcTo(x, y, x + r, y, r);
+    ctx.closePath();
+  }
+
+  const CW = 1400,
+    CH = 990; // canvas size (landscape ratio ~1.41)
+
   for (let i = 0; i < passers.length; i++) {
     const r = passers[i];
     const pct = Math.round((r.score / r.total) * 100);
+    const gradeLabel =
+      pct >= 90
+        ? "ممتاز"
+        : pct >= 75
+          ? "جيد جداً"
+          : pct >= 60
+            ? "جيد"
+            : "مقبول";
+    const gColor =
+      pct >= 90
+        ? "#0f9d58"
+        : pct >= 75
+          ? "#1a73e8"
+          : pct >= 60
+            ? "#7b2ff7"
+            : "#a07820";
+
     const cv = document.createElement("canvas");
     cv.width = CW;
     cv.height = CH;
-    drawCertificate(cv.getContext("2d"), CW, CH, D, {
-      name: r.name, grade: r.grade, examName: ex.name, score: r.score, total: r.total, pct,
-      ...certGradeInfo(pct), date, teacher: "الأستاذ / محمد جمال",
-    });
-    if (i > 0) pdf.addPage();
-    pdf.addImage(cv.toDataURL("image/jpeg", 0.97), "JPEG", 0, 0, pageW, pageH);
-  }
-  pdf.save(`شهادات_${ex.name}.pdf`);
-  logAction(`طباعة ${passers.length} شهادة (تصميم ${D.id}): ${ex.name}`);
-  showToast("✅ تم إنشاء " + passers.length + " شهادة");
-};
+    const ctx = cv.getContext("2d");
 
-window.openCertDesigns = async () => {
-  const ex = getCurEx();
-  if (!ex) return;
-  window._certSel = ex.certDesign || 1;
-  const g = document.getElementById("certDesignGrid");
-  g.innerHTML = "";
-  document.getElementById("certDesignModal").style.display = "flex";
-  if (document.fonts && document.fonts.ready) await document.fonts.ready;
-  CERT_DESIGNS.forEach((D) => {
-    const w = document.createElement("div");
-    w.className = "cert-opt" + (D.id === window._certSel ? " on" : "");
-    const cv = document.createElement("canvas");
-    cv.width = 700;
-    cv.height = 495;
-    const c2 = cv.getContext("2d");
-    c2.scale(0.5, 0.5);
-    drawCertificate(c2, 1400, 990, D, {
-      name: "اسم الطالب الرباعي", grade: "بكالوريا", examName: ex.name, score: 18, total: 20, pct: 90,
-      ...certGradeInfo(90), date: new Date().toLocaleDateString("ar-EG"), teacher: "الأستاذ / محمد جمال",
+    // ---- خلفية ----
+    const bg = ctx.createRadialGradient(CW / 2, 0, 0, CW / 2, CH / 2, CW * 0.8);
+    bg.addColorStop(0, "#ffffff");
+    bg.addColorStop(0.6, "#fffaf0");
+    bg.addColorStop(1, "#fff5dc");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, CW, CH);
+
+    // ---- إطار خارجي double ----
+    ctx.strokeStyle = "#c8a84b";
+    ctx.lineWidth = 8;
+    roundRect(ctx, 22, 22, CW - 44, CH - 44, 22);
+    ctx.stroke();
+    ctx.lineWidth = 2;
+    roundRect(ctx, 38, 38, CW - 76, CH - 76, 14);
+    ctx.stroke();
+
+    // ---- زخارف الأركان ----
+    const corners = [
+      [55, 55, 0],
+      [CW - 55, 55, Math.PI],
+      [55, CH - 55, Math.PI * 1.5],
+      [CW - 55, CH - 55, Math.PI * 0.5],
+    ];
+    ctx.font = "58px serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    corners.forEach(([cx, cy]) => {
+      ctx.fillText("🌿", cx, cy);
     });
-    w.appendChild(cv);
-    const n = document.createElement("div");
-    n.className = "cert-name";
-    n.innerText = `${D.id}. ${D.name}`;
-    w.appendChild(n);
-    w.onclick = () => {
-      window._certSel = D.id;
-      g.querySelectorAll(".cert-opt").forEach((x) => x.classList.remove("on"));
-      w.classList.add("on");
+
+    // ---- خط فاصل ذهبي ----
+    const drawGoldLine = (y) => {
+      const lg = ctx.createLinearGradient(CW * 0.2, y, CW * 0.8, y);
+      lg.addColorStop(0, "transparent");
+      lg.addColorStop(0.5, "#c8a84b");
+      lg.addColorStop(1, "transparent");
+      ctx.strokeStyle = lg;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(CW * 0.2, y);
+      ctx.lineTo(CW * 0.8, y);
+      ctx.stroke();
     };
-    g.appendChild(w);
-  });
-};
-window.saveCertDesign = (print) => {
-  const ex = getCurEx();
-  if (!ex) return;
-  ex.certDesign = window._certSel || 1;
-  saveExams();
-  closeModal("certDesignModal");
-  showToast("✅ تم حفظ تصميم الشهادة");
-  if (print) examPrintCertificates();
+
+    // ---- كوباية الكأس ----
+    ctx.font = "100px serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("🏆", CW / 2, 130);
+
+    // ---- شهادة تقدير ----
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = 'bold 72px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#a07820";
+    ctx.shadowColor = "rgba(200,168,75,0.35)";
+    ctx.shadowBlur = 12;
+    ctx.fillText("شهادة تقدير", CW / 2, 230);
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    drawGoldLine(270);
+
+    // ---- تشهد إدارة ----
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = '28px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#666666";
+    ctx.fillText("تشهد إدارة منصة امتحان لغة عربية بأن:", CW / 2, 310);
+    ctx.restore();
+
+    // ---- اسم الطالب — مستطيل أزرق ----
+    const nameBoxW = Math.min(900, CW - 160);
+    const nameBoxX = (CW - nameBoxW) / 2;
+    const nameBoxY = 345;
+    const nameBoxH = 90;
+    ctx.fillStyle = "#eaf2fe";
+    ctx.strokeStyle = "rgba(26,115,232,0.3)";
+    ctx.lineWidth = 2.5;
+    roundRect(ctx, nameBoxX, nameBoxY, nameBoxW, nameBoxH, 18);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = 'bold 52px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#1a73e8";
+    // تصغير الخط لو الاسم طويل
+    const nameMetrics = ctx.measureText(r.name);
+    if (nameMetrics.width > nameBoxW - 60) {
+      const ratio = (nameBoxW - 60) / nameMetrics.width;
+      const newSize = Math.floor(52 * ratio);
+      ctx.font = `bold ${Math.max(newSize, 28)}px "Tajawal","Cairo",sans-serif`;
+    }
+    ctx.fillText(r.name, CW / 2, nameBoxY + nameBoxH / 2);
+    ctx.restore();
+
+    // ---- من الصف وأجتاز ----
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = '28px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#444444";
+    ctx.fillText("قد اجتاز بنجاح امتحان", CW / 2, 480);
+    ctx.restore();
+
+    // ---- اسم الامتحان ----
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = 'bold 38px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#7b2ff7";
+    const examText = '"' + ex.name + '"';
+    const examMetrics = ctx.measureText(examText);
+    if (examMetrics.width > CW - 160) {
+      const ratio2 = (CW - 160) / examMetrics.width;
+      ctx.font = `bold ${Math.floor(38 * ratio2)}px "Tajawal","Cairo",sans-serif`;
+    }
+    ctx.fillText(examText, CW / 2, 535);
+    ctx.restore();
+
+    drawGoldLine(580);
+
+    // ---- بطاقات الدرجة / النسبة / التقدير ----
+    const cards = [
+      {
+        label: "الدرجة",
+        value: `${r.score}/${r.total}`,
+        color: "#0f9d58",
+        border: "rgba(15,157,88,0.3)",
+      },
+      {
+        label: "النسبة",
+        value: `${pct}%`,
+        color: "#1a73e8",
+        border: "rgba(26,115,232,0.3)",
+      },
+      {
+        label: "التقدير",
+        value: gradeLabel,
+        color: gColor,
+        border: gColor + "55",
+      },
+    ];
+    const cardW = 200,
+      cardH = 110,
+      cardGap = 60;
+    const cardsTotal = cards.length * cardW + (cards.length - 1) * cardGap;
+    const cardsStartX = (CW - cardsTotal) / 2;
+    const cardY = 600;
+    cards.forEach((card, ci) => {
+      const cx = cardsStartX + ci * (cardW + cardGap);
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = card.border;
+      ctx.lineWidth = 2.5;
+      roundRect(ctx, cx, cardY, cardW, cardH, 14);
+      ctx.fill();
+      ctx.stroke();
+      // قيمة
+      ctx.save();
+      ctx.direction = "rtl";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = `bold 34px "Tajawal","Cairo",sans-serif`;
+      ctx.fillStyle = card.color;
+      ctx.fillText(card.value, cx + cardW / 2, cardY + 38);
+      // تسمية
+      ctx.font = '18px "Cairo",sans-serif';
+      ctx.fillStyle = "#666666";
+      ctx.fillText(card.label, cx + cardW / 2, cardY + 78);
+      ctx.restore();
+    });
+
+    // ---- التوقيعات ----
+    const sigY = 760;
+    // خط المعلم (يسار)
+    ctx.strokeStyle = "#c8a84b";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(120, sigY);
+    ctx.lineTo(340, sigY);
+    ctx.stroke();
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = 'bold 22px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#a07820";
+    if (teacher) ctx.fillText(teacher, 230, sigY + 8);
+    ctx.font = '17px "Cairo",sans-serif';
+    ctx.fillStyle = "#aaaaaa";
+    ctx.fillText("التوقيع", 230, sigY + 36);
+    ctx.restore();
+    // نجوم وسط
+    ctx.font = "28px serif";
+    ctx.textAlign = "center";
+    ctx.fillText("✦ ✦ ✦", CW / 2, sigY - 2);
+    // خط التاريخ (يمين)
+    ctx.strokeStyle = "#c8a84b";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(CW - 340, sigY);
+    ctx.lineTo(CW - 120, sigY);
+    ctx.stroke();
+    ctx.save();
+    ctx.direction = "rtl";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.font = 'bold 22px "Tajawal","Cairo",sans-serif';
+    ctx.fillStyle = "#a07820";
+    ctx.fillText(date, CW - 230, sigY + 8);
+    ctx.font = '17px "Cairo",sans-serif';
+    ctx.fillStyle = "#aaaaaa";
+    ctx.fillText("تاريخ الإصدار", CW - 230, sigY + 36);
+    ctx.restore();
+
+    // ---- تحويل لـ PDF ----
+    const imgData = cv.toDataURL("image/jpeg", 0.97);
+    if (i > 0) pdf.addPage();
+    pdf.addImage(imgData, "JPEG", 0, 0, pageW, pageH);
+  }
+
+  pdf.save(`شهادات_${ex.name}.pdf`);
+  logAction(`طباعة ${passers.length} شهادة: ${ex.name}`);
+  showToast("✅ تم إنشاء " + passers.length + " شهادة");
 };
 
 // --- Question analytics ---
@@ -2584,6 +2673,7 @@ window.examQuestionAnalytics = async () => {
   const totalStudents = list.length;
   const stats = (ex.questions || [])
     .map((q, qi) => {
+      if (q.type === "essay") return null;
       let correct = 0,
         wrong = 0,
         blank = 0;
@@ -2594,15 +2684,8 @@ window.examQuestionAnalytics = async () => {
           blank++;
           return;
         }
-        if (isEssay(sq)) {
-          const g = (r.essayGrades || {})[qi];
-          if (r.pending || !g) blank++;
-          else if ((g.mark || 0) >= qPoints(sq) / 2) correct++;
-          else wrong++;
-          return;
-        }
         const ua = r.userAnswers?.[qi];
-        if (ua === undefined) blank++;
+        if (ua === undefined || ua === null) blank++;
         else if (ua === sq.c) correct++;
         else wrong++;
       });
@@ -2611,9 +2694,13 @@ window.examQuestionAnalytics = async () => {
         : 0;
       return { q: q.q, correct, wrong, blank, pct, qi: qi + 1 };
     })
+    .filter(Boolean)
     .sort((a, b) => a.pct - b.pct);
   const c = document.getElementById("qAnalyticsArea");
-  c.innerHTML = stats
+  const essayNote = (ex.questions || []).some((q) => q.type === "essay")
+    ? '<p class="essay-pending-notice">الأسئلة المقالية غير داخلة في التحليل لأنها بتتصحح يدوياً.</p>'
+    : "";
+  c.innerHTML = essayNote + stats
     .map((s) => {
       const color =
         s.pct >= 70 ? "var(--S)" : s.pct >= 40 ? "var(--W)" : "var(--D)";
@@ -2652,14 +2739,15 @@ window.examExportFull = async () => {
 // --- Branding ---
 function applyBranding() {
   const b = window._branding || {};
-  if (b.title) {
+  applySiteBackground();
+  // أي اسم مدرس قديم متخزن في قاعدة البيانات مش هيظهر
+  const clean = (v) => (/محمد\s*جمال/.test(String(v || "")) ? "" : String(v || ""));
+  if (clean(b.title)) {
     const t = document.querySelector(".login-title");
-    if (t) t.innerText = b.title;
+    if (t) t.innerText = clean(b.title);
   }
-  if (b.subtitle) {
-    const s = document.querySelector(".login-sub");
-    if (s) s.innerText = b.subtitle;
-  }
+  const sub = document.querySelector(".login-sub");
+  if (sub) sub.innerText = clean(b.subtitle);
   if (b.emoji) {
     const l = document.querySelector(".login-logo");
     if (l) l.innerText = b.emoji;
@@ -2686,7 +2774,7 @@ onValue(ref(db, "branding"), (snap) => {
 window.openBrandingModal = () => {
   const b = window._branding || {};
   document.getElementById("brandTitle").value = b.title || "";
-  document.getElementById("brandSubtitle").value = b.subtitle || "";
+  document.getElementById("brandSubtitle").value = /محمد\s*جمال/.test(b.subtitle || "") ? "" : b.subtitle || "";
   document.getElementById("brandEmoji").value = b.emoji || "";
   document.getElementById("brandingModal").style.display = "flex";
 };
@@ -2695,9 +2783,8 @@ window.saveBranding = () => {
     title: document.getElementById("brandTitle").value.trim(),
     subtitle: document.getElementById("brandSubtitle").value.trim(),
     emoji: document.getElementById("brandEmoji").value.trim(),
-    welcomeMsg: (window._branding || {}).welcomeMsg || "",
   };
-  set(ref(db, "branding"), b);
+  update(ref(db, "branding"), b);
   closeModal("brandingModal");
   alert("✅ تم حفظ هوية الموقع");
 };
@@ -2707,9 +2794,9 @@ window.openWelcomeMsgModal = () => {
   document.getElementById("welcomeMsgModal").style.display = "flex";
 };
 window.saveWelcomeMsg = () => {
-  const cur = window._branding || {};
-  cur.welcomeMsg = document.getElementById("welcomeMsgInput").value;
-  set(ref(db, "branding"), cur);
+  update(ref(db, "branding"), {
+    welcomeMsg: document.getElementById("welcomeMsgInput").value,
+  });
   closeModal("welcomeMsgModal");
   alert("✅ تم حفظ رسالة الترحيب");
 };
@@ -2932,12 +3019,10 @@ window.sendComplaint = async () => {
 
   const nameVal = document.getElementById("nameInput").value.trim();
   const phoneVal = document.getElementById("phoneInput").value.trim();
-  const gradeVal = studentGrade;
 
   const complaint = {
     name: nameVal || "زائر غير مسجل",
     phone: phoneVal || "غير متاح",
-    grade: gName(gradeVal),
     text,
     time: new Date().toLocaleString("ar-EG"),
     timestamp: Date.now(),
@@ -2954,7 +3039,6 @@ window.sendComplaint = async () => {
 };
 
 window.loadAdminComplaints = async () => {
-  loadAdminGrievances();
   const c = document.getElementById("complaintsContainer");
   c.innerHTML =
     '<p style="color:var(--TS);text-align:center;padding:20px">جاري التحميل...</p>';
@@ -2975,7 +3059,7 @@ window.loadAdminComplaints = async () => {
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px">
         <div>
           <div style="font-size:15px;font-weight:800;color:var(--TX)">👤 ${r.name}</div>
-          <div style="font-size:12px;color:var(--TS);margin-top:2px">📚 ${r.grade || "-"} &nbsp;|&nbsp; 📱 <span id="phone_${key}" style="font-family:monospace">••••••</span>
+          <div style="font-size:12px;color:var(--TS);margin-top:2px">📱 <span id="phone_${key}" style="font-family:monospace">••••••</span>
             <button onclick="toggleAdminPhone('${key}','${(r.phone || "").replace(/'/g, "\\'")}',this)" style="background:var(--IB);border:1px solid var(--BR);border-radius:6px;padding:1px 7px;cursor:pointer;font-size:10px;font-family:'Cairo',sans-serif;font-weight:700;color:var(--TS);margin-right:4px;transition:.2s">إظهار</button>
           </div>
         </div>
@@ -3022,26 +3106,17 @@ window.clearAllComplaints = async () => {
 onValue(ref(db, "complaints"), (snap) => {
   const data = snap.val();
   const unread = data ? Object.values(data).filter((c) => !c.read).length : 0;
-  window._cmpUnread = unread;
-  updateComplaintsBadge();
+  const tab = document.querySelector(
+    "[onclick=\"switchTab('complaints',this)\"]",
+  );
+  if (tab) tab.innerText = unread > 0 ? `📢 الشكاوى (${unread})` : "📢 الشكاوى";
 });
 
 // ===== AI EXTRACT =====
-let aiGrade = "second";
 let aiExtractedQs = [];
 let _aiFileText = "";
 let _aiFileB64 = "";
 let _aiFileIsImg = false;
-
-window.aiSelectGrade = (btn) => {
-  aiGrade = btn.dataset.g;
-  document.querySelectorAll("#aiGradeRow button").forEach((b) => {
-    const on = b === btn;
-    b.style.background = on ? "var(--P)" : "var(--CB)";
-    b.style.color = on ? "#fff" : "var(--TX)";
-    b.style.borderColor = on ? "var(--P)" : "var(--BR)";
-  });
-};
 
 window.openAIExtractModal = () => {
   window.resetAIExtract();
@@ -3188,7 +3263,6 @@ window.runAIExtract = async () => {
       throw new Error("لم يتم استخراج أي أسئلة");
     aiExtractedQs = parsed.map((q) => ({
       ...q,
-      grade: aiGrade,
       active: true,
     }));
     _renderAIResults();
@@ -3243,7 +3317,6 @@ window.aiAddToExam = () => {
 };
 
 // ===== INIT =====
-loadGrade();
 const sb = document.getElementById("soundBtn");
 if (sb) sb.innerText = soundOn ? "🔊 الأصوات: مفعل" : "🔇 الأصوات: معطل";
 
@@ -3257,305 +3330,759 @@ const urlExamId = new URLSearchParams(location.search).get("exam");
 if (urlExamId) window._directExamId = urlExamId;
 
 // =====================================================================
-// ===== إضافات: مقالي / تظلم / متصلون الآن / داش بورد / تصميم الواجهة =====
+// ===== حسابات الأدمن + المالك + خلفية الموقع + منتدى الأدمن =====
 // =====================================================================
-const esc = (t) =>
-  String(t ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-const isEssay = (q) => !!q && q.type === "essay";
-const qPoints = (q) => (isEssay(q) ? Number(q.maxMark) || 1 : 1);
-let qeType = "mcq";
 
-// ----- محرر السؤال: نوع السؤال -----
-window.qeSelectType = (t) => {
-  qeType = t;
-  document.querySelectorAll("#qeTypeSection [data-t]").forEach((b) => b.classList.toggle("on", b.dataset.t === t));
-  document.getElementById("qeEssayExtra").style.display = t === "essay" ? "block" : "none";
-  const sec = document.getElementById("qeAnswersWrap").closest(".qe-section");
-  if (sec) sec.style.display = t === "essay" ? "none" : "";
-};
+// ---------- helpers ----------
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[c]);
+}
 
-// ----- واجهة الطالب: إجابة مقالية -----
-function renderEssayInput(q) {
-  const d = document.getElementById("optionsDiv");
-  d.innerHTML = `<div class="essay-box"><div class="essay-tag">✍️ سؤال مقالي — ${qPoints(q)} درجة (بيتصحح بواسطة الأستاذ)</div><textarea id="essayInput" class="essay-input" rows="8" placeholder="اكتب إجابتك هنا..."></textarea></div>`;
-  const t = document.getElementById("essayInput");
-  t.value = answers[cur] || "";
-  t.oninput = () => {
-    answers[cur] = t.value.trim() ? t.value : undefined;
-    updateSidebarGrid();
-    updateProg();
+function safeImageSource(value) {
+  const src = String(value || "").trim();
+  return /^(data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+$|https:\/\/[^\s"'()\\]+$)/i.test(
+    src,
+  )
+    ? src
+    : "";
+}
+
+function base64FromBytes(bytes) {
+  let binary = "";
+  bytes.forEach((b) => (binary += String.fromCharCode(b)));
+  return btoa(binary);
+}
+
+async function makePasswordHash(password, saltBase64 = "") {
+  if (!window.crypto || !crypto.subtle)
+    throw new Error("المتصفح لا يدعم التشفير. افتح الموقع عبر رابط https.");
+  const salt = saltBase64
+    ? Uint8Array.from(atob(saltBase64), (c) => c.charCodeAt(0))
+    : crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: 150000, hash: "SHA-256" },
+    key,
+    256,
+  );
+  return {
+    salt: base64FromBytes(salt),
+    hash: base64FromBytes(new Uint8Array(bits)),
   };
 }
 
-// ----- مراجعة المقالي للطالب + زر التظلم -----
-function renderEssayReview(d) {
-  const sq = d.questionsSnapshot || [];
-  let h = "";
-  sq.forEach((q, i) => {
-    if (!isEssay(q)) return;
-    const g = (d.essayGrades || {})[i] || {};
-    const ans = d.userAnswers ? d.userAnswers[i] : null;
-    h += `<div class="essay-review">
-      <div class="er-q">✍️ ${i + 1}. ${esc(q.q)}</div>
-      <div class="er-ans"><b>إجابتك:</b><br>${ans ? esc(ans).replace(/\n/g, "<br>") : "<i>لم تجب</i>"}</div>
-      <div class="er-mark">الدرجة: <b>${g.mark ?? 0} / ${qPoints(q)}</b></div>
-      ${g.comment ? `<div class="er-cmt">💬 تعليق الأستاذ: ${esc(g.comment)}</div>` : ""}
-      ${d.code ? `<button class="abtn bg-orange" style="padding:7px 14px;font-size:12px;margin-top:8px" onclick="openGrievance('${d.code}',${i})">⚖️ تظلم على التصحيح</button>` : ""}
-    </div>`;
-  });
-  return h ? `<h4 style="margin:18px 0 8px;text-align:right">✍️ الأسئلة المقالية</h4>` + h : "";
+async function verifyPassword(password, cred) {
+  if (!cred || !cred.salt || !cred.hash) return false;
+  const r = await makePasswordHash(password, cred.salt);
+  return r.hash === cred.hash;
 }
 
-// ----- تظلم الطالب -----
-window.openGrievance = async (code, qi) => {
-  const d = window._lastResult;
-  if (!d) return;
-  const ex = await get(ref(db, `grievances/${code}_${qi}`));
-  if (ex.exists()) return alert("⚠️ سبق وقدمت تظلم على هذا السؤال، وبيتراجع من الأستاذ.");
-  window._grv = { code, qi };
-  const q = d.questionsSnapshot[qi];
-  const g = (d.essayGrades || {})[qi] || {};
-  document.getElementById("grvInfo").innerHTML = `<b>${esc(q.q)}</b><br>درجتك الحالية: ${g.mark ?? 0}/${qPoints(q)}`;
-  document.getElementById("grvText").value = "";
-  document.getElementById("grievanceModal").style.display = "flex";
-};
-window.sendGrievance = async () => {
-  const G = window._grv,
-    d = window._lastResult;
-  if (!G || !d) return;
-  const text = document.getElementById("grvText").value.trim();
-  if (text.length < 5) return alert("⚠️ اكتب سبب التظلم بوضوح");
-  const q = d.questionsSnapshot[G.qi];
-  const g = (d.essayGrades || {})[G.qi] || {};
-  try {
-    await set(ref(db, `grievances/${G.code}_${G.qi}`), {
-      code: G.code,
-      examId: d.examId || "",
-      examName: d.examName || "",
-      name: d.name,
-      qi: G.qi,
-      qText: q.q,
-      answer: (d.userAnswers && d.userAnswers[G.qi]) || "",
-      mark: g.mark ?? 0,
-      maxMark: qPoints(q),
-      comment: g.comment || "",
-      text,
-      status: "pending",
-      time: new Date().toLocaleString("ar-EG"),
-      timestamp: Date.now(),
-    });
-    closeModal("grievanceModal");
-    alert("✅ تم إرسال التظلم. هيراجعه الأستاذ ويعدل الدرجة لو لزم.");
-  } catch (e) {
-    alert("❌ حدث خطأ: " + e.message);
-  }
-};
+const acctCred = (a) =>
+  a && a.passwordSalt && a.passwordHash
+    ? { salt: a.passwordSalt, hash: a.passwordHash }
+    : null;
 
-// ----- تصحيح المقالي (أدمن) -----
-window.openEssayGrade = async (examId, code, grvKey) => {
-  const snap = await get(ref(db, `examResults/${examId}/${code}`));
-  if (!snap.exists()) return alert("النتيجة غير موجودة");
-  const r = snap.val();
-  window._grading = { examId, code, r, grvKey: grvKey || null };
-  document.getElementById("egTitle").innerText = `✍️ تصحيح: ${r.name}`;
-  document.getElementById("egInfo").innerText = `${r.examName || ""} — كود ${code}`;
-  let h = "";
-  (r.questionsSnapshot || []).forEach((q, i) => {
-    if (!isEssay(q)) return;
-    const g = (r.essayGrades || {})[i] || {};
-    const max = qPoints(q);
-    const ans = r.userAnswers ? r.userAnswers[i] : null;
-    h += `<div class="eg-item">
-      <div class="eg-q">${i + 1}. ${esc(q.q)}</div>
-      ${q.model ? `<div class="eg-model">✅ <b>نموذج الإجابة:</b> ${esc(q.model)}</div>` : ""}
-      <div class="eg-ans"><b>إجابة الطالب:</b><br>${ans ? esc(ans).replace(/\n/g, "<br>") : "<i>لم يجب</i>"}</div>
-      <div class="eg-row">
-        <label>الدرجة (من ${max})</label>
-        <input type="number" id="egMark${i}" min="0" max="${max}" step="0.5" value="${g.mark ?? ""}" placeholder="0" />
-        <input type="text" id="egCmt${i}" placeholder="تعليق للطالب (اختياري)" value="${esc(g.comment || "")}" />
-      </div></div>`;
+async function getOwnerRecord() {
+  const rec = (await get(ref(db, "adminProfiles/owner"))).val() || {};
+  const cred = acctCred(rec) || OWNER_DEFAULT;
+  return { rec, cred };
+}
+
+// هل كلمة السر مستخدمة عند المالك أو أدمن تاني؟ (الدخول بكلمة السر لازم تكون فريدة)
+async function passwordTaken(password, exceptId) {
+  if (exceptId !== "owner") {
+    const { cred } = await getOwnerRecord();
+    if (await verifyPassword(password, cred)) return true;
+  }
+  const accounts = (await get(ref(db, "adminAccounts"))).val() || {};
+  for (const [id, a] of Object.entries(accounts)) {
+    if (id === exceptId) continue;
+    if (await verifyPassword(password, acctCred(a))) return true;
+  }
+  return false;
+}
+
+async function compressImageFile(file, maxBytes = 300000, maxSide = 1440) {
+  if (!file || !file.type?.startsWith("image/"))
+    throw new Error("اختر ملف صورة صالحاً.");
+  if (file.size > 12 * 1024 * 1024)
+    throw new Error("حجم الصورة الأصلية أكبر من 12 ميجابايت.");
+  const originalData = await new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(new Error("تعذرت قراءة الصورة."));
+    r.readAsDataURL(file);
   });
-  document.getElementById("egBody").innerHTML = h || "<p>لا توجد أسئلة مقالية</p>";
-  document.getElementById("essayGradeModal").style.display = "flex";
-};
-window.saveEssayGrades = async () => {
-  const G = window._grading;
-  if (!G) return;
-  const r = G.r,
-    qs = r.questionsSnapshot || [];
-  let mcq = r.mcqScore;
-  if (mcq === undefined) {
-    mcq = 0;
-    qs.forEach((q, i) => {
-      if (!isEssay(q) && r.userAnswers && r.userAnswers[i] === q.c) mcq++;
-    });
+  const image = new Image();
+  await new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = () => reject(new Error("تعذر فتح ملف الصورة."));
+    image.src = originalData;
+  });
+  let scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("تعذر تجهيز الصورة.");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const quality = Math.max(0.42, 0.82 - attempt * 0.045);
+    const result = canvas.toDataURL("image/jpeg", quality);
+    const bytes = Math.ceil((result.length - result.indexOf(",") - 1) * 0.75);
+    if (bytes <= maxBytes) return result;
+    if (attempt % 3 === 2) scale *= 0.82;
   }
-  const essayGrades = {};
-  let sum = 0;
-  for (let i = 0; i < qs.length; i++) {
-    if (!isEssay(qs[i])) continue;
-    const v = document.getElementById("egMark" + i).value;
-    if (v === "") return alert("أدخل درجة لكل سؤال مقالي (ولو صفر)");
-    const m = Math.min(Math.max(parseFloat(v) || 0, 0), qPoints(qs[i]));
-    essayGrades[i] = { mark: m, comment: document.getElementById("egCmt" + i).value.trim() };
-    sum += m;
+  throw new Error("الصورة ما زالت كبيرة بعد ضغطها. اختر صورة أصغر.");
+}
+
+function setImagePreview(id, source, alt) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const src = safeImageSource(source);
+  el.innerHTML = src ? `<img src="${esc(src)}" alt="${esc(alt || "")}">` : "";
+}
+
+const isOwner = () => window._currentAdmin?.role === "owner";
+function requireOwner() {
+  if (isOwner()) return false;
+  alert("هذا الإجراء متاح لمالك الموقع فقط.");
+  return true;
+}
+const validPassword = (pw) => typeof pw === "string" && pw.length >= 8;
+
+async function logAction(a) {
+  push(ref(db, "adminLogs"), {
+    action: a,
+    admin: window._currentAdmin?.name || "",
+    time: new Date().toLocaleString("ar-EG"),
+  });
+}
+
+// ---------- login ----------
+let _authFails = 0,
+  _authLockUntil = 0,
+  _authBusy = false;
+
+window.checkAdminAuth = async () => {
+  if (_authBusy) return;
+  if (Date.now() < _authLockUntil) {
+    const sec = Math.ceil((_authLockUntil - Date.now()) / 1000);
+    return alert(`محاولات كتير غلط. استنى ${sec} ثانية وجرّب تاني.`);
   }
-  const score = mcq + sum;
-  const pct = Math.round((score / r.total) * 100);
-  const upd = { essayGrades, score, mcqScore: mcq, pending: false, passed: pct >= (r.passMark || 50), gradedAt: Date.now() };
+  const input = document.getElementById("adminPassInput");
+  const p = input.value;
+  if (!p) return;
+  _authBusy = true;
   try {
-    await update(ref(db, `examResults/${G.examId}/${G.code}`), upd);
-    await update(ref(db, `results/${G.code}`), upd);
-    if (G.grvKey) await update(ref(db, `grievances/${G.grvKey}`), { status: "resolved", resolvedAt: Date.now() });
+    const { rec, cred } = await getOwnerRecord();
+    if (await verifyPassword(p, cred)) {
+      _authFails = 0;
+      await openAdminSession({
+        id: "owner",
+        role: "owner",
+        name: rec.name || ownerProfile.name,
+        photo: rec.photo || "",
+      });
+      return;
+    }
+    const accounts = (await get(ref(db, "adminAccounts"))).val() || {};
+    for (const [id, a] of Object.entries(accounts)) {
+      if (!(await verifyPassword(p, acctCred(a)))) continue;
+      if (a.active === false) {
+        return alert("حساب الأدمن ده متعطّل. كلّم المالك.");
+      }
+      _authFails = 0;
+      await openAdminSession({ id, role: "admin", name: a.name, photo: a.photo });
+      return;
+    }
+    _authFails++;
+    if (_authFails >= 5) {
+      _authFails = 0;
+      _authLockUntil = Date.now() + 30000;
+    }
+    alert("❌ كلمة السر خطأ!");
   } catch (e) {
-    return alert("❌ حدث خطأ: " + e.message);
+    console.error("Admin sign-in failed", e);
+    alert(e.message || "تعذر التحقق من الحساب. تأكد من الاتصال وحاول تاني.");
+  } finally {
+    _authBusy = false;
   }
-  closeModal("essayGradeModal");
-  showToast("✅ تم حفظ التصحيح — النتيجة ظهرت للطالب");
-  logAction(`تصحيح مقالي: ${r.name} - ${score}/${r.total}`);
-  if (getCurEx()) loadExamResultsTab();
-  loadAdminGrievances();
 };
 
-// ----- التظلمات (أدمن) -----
-window.loadAdminGrievances = async () => {
-  const c = document.getElementById("grievancesContainer");
-  if (!c) return;
-  const data = (await get(ref(db, "grievances"))).val();
-  if (!data) {
-    c.innerHTML = '<p style="color:var(--TS);text-align:center;padding:14px">لا توجد تظلمات</p>';
+async function openAdminSession(admin) {
+  window._currentAdmin = {
+    id: admin.id,
+    role: admin.role,
+    name: admin.name || (admin.role === "owner" ? "مالك الموقع" : "أدمن"),
+    photo: safeImageSource(admin.photo),
+  };
+  pendingAdminProfilePhoto = null;
+  document.body.classList.add("is-admin");
+  document.body.classList.toggle("owner-admin", admin.role === "owner");
+  document.getElementById("adminPanel").style.display = "block";
+  backToExamsList();
+  renderBankList();
+  renderAdminAccounts();
+  updateAdminIdentity(true);
+  hideAdminAuth();
+  document.getElementById("adminPassInput").value = "";
+  // ارجع لأول تاب (امتحانات) عند كل دخول
+  const firstTab = document.querySelector("#adminMainView .atab");
+  if (firstTab) window.switchTab("exams", firstTab);
+  renderForum();
+  logAction("دخول لوحة التحكم");
+}
+
+window.closeAdminPanel = () => {
+  document.getElementById("adminPanel").style.display = "none";
+  document.body.classList.remove("is-admin", "owner-admin");
+  window._currentAdmin = null;
+};
+
+function updateAdminIdentity(fillProfile = false) {
+  const admin = window._currentAdmin;
+  if (!admin) return;
+  const title = document.getElementById("adminHeaderTitle");
+  const avatar = document.getElementById("adminHeaderAvatar");
+  const badge = document.getElementById("adminRoleBadge");
+  if (title) title.innerText = `⚙️ لوحة التحكم — ${admin.name}`;
+  if (badge) {
+    badge.innerText = admin.role === "owner" ? "👑 المالك" : "أدمن";
+    badge.className = "role-badge" + (admin.role === "owner" ? " owner" : "");
+  }
+  if (avatar) {
+    const src = safeImageSource(admin.photo);
+    avatar.hidden = !src;
+    if (src) avatar.src = src;
+    else avatar.removeAttribute("src");
+  }
+  if (fillProfile) {
+    const n = document.getElementById("adminProfileNameInput");
+    if (n) n.value = admin.name;
+    setImagePreview("adminProfilePreview", admin.photo, "صورتي");
+    const f = document.getElementById("adminProfileFile");
+    if (f) f.value = "";
+  }
+}
+
+window.openMyAccountTab = () => {
+  const b = document.getElementById("accountTabBtn");
+  if (b) window.switchTab("account", b);
+};
+
+// ---------- live data ----------
+onValue(ref(db, "adminAccounts"), (snap) => {
+  adminAccounts = snap.val() || {};
+  renderAdminAccounts();
+  const me = window._currentAdmin;
+  if (me && me.role === "admin") {
+    const cur = adminAccounts[me.id];
+    if (!cur || cur.active === false) {
+      window.closeAdminPanel();
+      alert("تم تعطيل حساب الأدمن بتاعك أو حذفه.");
+    } else {
+      window._currentAdmin = {
+        ...me,
+        name: cur.name || me.name,
+        photo: safeImageSource(cur.photo),
+      };
+      updateAdminIdentity();
+    }
+  }
+  renderForum();
+});
+
+onValue(ref(db, "adminProfiles/owner"), (snap) => {
+  const v = snap.val() || {};
+  ownerProfile = {
+    name: v.name || "مالك الموقع",
+    photo: safeImageSource(v.photo),
+  };
+  if (window._currentAdmin?.id === "owner") {
+    window._currentAdmin = { ...window._currentAdmin, ...ownerProfile };
+    updateAdminIdentity();
+  }
+  renderForum();
+});
+
+// ---------- accounts management (owner) ----------
+function renderAdminAccounts() {
+  const list = document.getElementById("adminAccountsList");
+  if (!list) return;
+  const entries = Object.entries(adminAccounts || {});
+  if (!entries.length) {
+    list.innerHTML = '<p class="admin-help">لسه مفيش حسابات أدمن. أنشئ أول حساب من فوق.</p>';
     return;
   }
-  const list = Object.entries(data).sort((a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0));
-  c.innerHTML = list
-    .map(([key, g]) => {
-      const done = g.status === "resolved";
-      return `<div style="background:var(--CB);border:1.5px solid ${done ? "var(--BR)" : "#f9ab00"};border-radius:16px;padding:14px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-        <b>👤 ${esc(g.name)} <small style="color:var(--TS)">(${esc(g.examName)})</small></b>
-        <span style="font-size:11px;color:var(--TS)">${esc(g.time)} ${done ? "• ✅ تمت المراجعة" : "• ⏳ جديد"}</span>
+  list.innerHTML = entries
+    .map(([id, a]) => {
+      const name = esc(a.name || "أدمن");
+      const photo = safeImageSource(a.photo);
+      const avatar = photo
+        ? `<img src="${esc(photo)}" alt="">`
+        : `<span class="admin-account-placeholder">${esc((a.name || "أ").slice(0, 1))}</span>`;
+      const off = a.active === false;
+      return `<div class="admin-account-row">
+        <div class="admin-account-info">${avatar}<span>${name}<small class="${off ? "off" : ""}">${off ? "متعطّل" : "مفعّل"}</small></span></div>
+        <div class="admin-inline-actions">
+          <button class="abtn bg-blue" onclick="resetAdminPassword('${esc(id)}')">🔑 كلمة السر</button>
+          <button class="abtn bg-orange" onclick="toggleAdminAccount('${esc(id)}')">${off ? "تفعيل" : "تعطيل"}</button>
+          <button class="abtn bg-red" onclick="deleteAdminAccount('${esc(id)}')">حذف</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+window.previewAdminPhoto = async (input, target) => {
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    const img = await compressImageFile(file, 120000, 480);
+    if (target === "new") {
+      pendingNewAdminPhoto = img;
+      setImagePreview("newAdminPhotoPreview", img, "صورة الأدمن الجديد");
+    } else {
+      pendingAdminProfilePhoto = img;
+      setImagePreview("adminProfilePreview", img, "صورتي");
+    }
+  } catch (e) {
+    alert(e.message || "تعذر تحميل الصورة.");
+    input.value = "";
+  }
+};
+
+window.createAdminAccount = async () => {
+  if (requireOwner()) return;
+  const name = document.getElementById("newAdminName").value.trim();
+  const password = document.getElementById("newAdminPassword").value;
+  if (!name) return alert("اكتب اسم الأدمن.");
+  if (!validPassword(password))
+    return alert("كلمة السر لازم تكون 8 أحرف على الأقل.");
+  try {
+    if (await passwordTaken(password, null))
+      return alert("كلمة السر دي مستخدمة بالفعل. اختار كلمة سر مختلفة لكل أدمن.");
+    const cred = await makePasswordHash(password);
+    await set(push(ref(db, "adminAccounts")), {
+      name,
+      photo: safeImageSource(pendingNewAdminPhoto),
+      passwordSalt: cred.salt,
+      passwordHash: cred.hash,
+      active: true,
+      createdAt: Date.now(),
+    });
+    document.getElementById("newAdminName").value = "";
+    document.getElementById("newAdminPassword").value = "";
+    document.getElementById("newAdminPhotoFile").value = "";
+    document.getElementById("newAdminPhotoPreview").replaceChildren();
+    pendingNewAdminPhoto = "";
+    logAction(`إنشاء حساب أدمن: ${name}`);
+    showToast("✅ تم إنشاء حساب الأدمن");
+  } catch (e) {
+    console.error(e);
+    alert(e.message || "تعذر إنشاء الحساب. تحقق من الاتصال وحاول تاني.");
+  }
+};
+
+window.resetAdminPassword = async (id) => {
+  if (requireOwner()) return;
+  const acc = adminAccounts[id];
+  if (!acc) return;
+  const pw = prompt(`كلمة السر الجديدة للأدمن "${acc.name}" (8 أحرف على الأقل):`);
+  if (pw === null) return;
+  if (!validPassword(pw)) return alert("كلمة السر لازم تكون 8 أحرف على الأقل.");
+  try {
+    if (await passwordTaken(pw, id))
+      return alert("كلمة السر دي مستخدمة بالفعل. اختار كلمة سر مختلفة.");
+    const cred = await makePasswordHash(pw);
+    await update(ref(db, `adminAccounts/${id}`), {
+      passwordSalt: cred.salt,
+      passwordHash: cred.hash,
+    });
+    logAction(`تغيير كلمة سر الأدمن: ${acc.name}`);
+    showToast("✅ تم تغيير كلمة السر");
+  } catch (e) {
+    console.error(e);
+    alert(e.message || "تعذر تغيير كلمة السر.");
+  }
+};
+
+window.toggleAdminAccount = async (id) => {
+  if (requireOwner()) return;
+  const acc = adminAccounts[id];
+  if (!acc) return;
+  try {
+    await update(ref(db, `adminAccounts/${id}`), { active: acc.active === false });
+    logAction(`${acc.active === false ? "تفعيل" : "تعطيل"} حساب الأدمن: ${acc.name}`);
+  } catch (e) {
+    console.error(e);
+    alert("تعذر تحديث الحساب.");
+  }
+};
+
+window.deleteAdminAccount = async (id) => {
+  if (requireOwner()) return;
+  const acc = adminAccounts[id];
+  if (!acc || !confirm(`حذف حساب الأدمن "${acc.name}" نهائياً؟`)) return;
+  try {
+    await remove(ref(db, `adminAccounts/${id}`));
+    logAction(`حذف حساب الأدمن: ${acc.name}`);
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حذف الحساب.");
+  }
+};
+
+// ---------- my profile / my password (any admin) ----------
+window.saveAdminProfile = async () => {
+  const me = window._currentAdmin;
+  if (!me) return alert("سجّل الدخول للوحة التحكم الأول.");
+  const name = document.getElementById("adminProfileNameInput").value.trim();
+  if (!name) return alert("اكتب اسمك.");
+  const photo =
+    pendingAdminProfilePhoto !== null
+      ? pendingAdminProfilePhoto
+      : safeImageSource(me.photo);
+  const path = me.role === "owner" ? "adminProfiles/owner" : `adminAccounts/${me.id}`;
+  try {
+    await update(ref(db, path), { name, photo });
+    window._currentAdmin = { ...me, name, photo };
+    pendingAdminProfilePhoto = null;
+    updateAdminIdentity(true);
+    showToast("✅ تم حفظ ملفك الشخصي");
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حفظ الملف الشخصي.");
+  }
+};
+
+window.removeMyPhoto = async () => {
+  const me = window._currentAdmin;
+  if (!me || !confirm("حذف صورتك؟")) return;
+  const path = me.role === "owner" ? "adminProfiles/owner" : `adminAccounts/${me.id}`;
+  try {
+    await update(ref(db, path), { photo: "" });
+    window._currentAdmin = { ...me, photo: "" };
+    pendingAdminProfilePhoto = null;
+    updateAdminIdentity(true);
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حذف الصورة.");
+  }
+};
+
+window.changeMyPassword = async () => {
+  const me = window._currentAdmin;
+  if (!me) return;
+  const oldPw = document.getElementById("myOldPass").value;
+  const newPw = document.getElementById("myNewPass").value;
+  const newPw2 = document.getElementById("myNewPass2").value;
+  if (!oldPw) return alert("اكتب كلمة السر الحالية.");
+  if (!validPassword(newPw)) return alert("كلمة السر الجديدة لازم تكون 8 أحرف على الأقل.");
+  if (newPw !== newPw2) return alert("تأكيد كلمة السر مش مطابق.");
+  try {
+    let cred, path;
+    if (me.role === "owner") {
+      cred = (await getOwnerRecord()).cred;
+      path = "adminProfiles/owner";
+    } else {
+      cred = acctCred((await get(ref(db, `adminAccounts/${me.id}`))).val());
+      path = `adminAccounts/${me.id}`;
+    }
+    if (!(await verifyPassword(oldPw, cred)))
+      return alert("❌ كلمة السر الحالية غلط.");
+    if (await passwordTaken(newPw, me.id))
+      return alert("كلمة السر دي مستخدمة بالفعل. اختار كلمة سر مختلفة.");
+    const n = await makePasswordHash(newPw);
+    await update(ref(db, path), { passwordSalt: n.salt, passwordHash: n.hash });
+    ["myOldPass", "myNewPass", "myNewPass2"].forEach(
+      (id) => (document.getElementById(id).value = ""),
+    );
+    logAction("تغيير كلمة السر الشخصية");
+    showToast("✅ تم تغيير كلمة السر");
+  } catch (e) {
+    console.error(e);
+    alert(e.message || "تعذر تغيير كلمة السر.");
+  }
+};
+
+// ---------- site background (owner only) ----------
+const BG_PRESETS = ["ocean", "sand", "night", "olive"];
+
+function applySiteBackground() {
+  const b = window._branding || {};
+  const image = safeImageSource(b.backgroundImage);
+  const root = document.documentElement;
+  if (image && b.backgroundPreset === "custom") {
+    root.style.setProperty("--site-bg", `url("${image}")`);
+    document.body.dataset.bg = "custom";
+  } else {
+    root.style.removeProperty("--site-bg");
+    document.body.dataset.bg = BG_PRESETS.includes(b.backgroundPreset)
+      ? b.backgroundPreset
+      : "default";
+  }
+  if (!pendingSiteBackground) {
+    setImagePreview(
+      "siteBackgroundPreview",
+      b.backgroundPreset === "custom" ? image : "",
+      "خلفية الموقع الحالية",
+    );
+  }
+  updateWelcomeBg();
+}
+
+window.previewSiteBackground = async (input) => {
+  if (requireOwner()) {
+    input.value = "";
+    return;
+  }
+  const file = input.files?.[0];
+  if (!file) return;
+  try {
+    pendingSiteBackground = await compressImageFile(file, 500000, 1600);
+    setImagePreview("siteBackgroundPreview", pendingSiteBackground, "معاينة الخلفية");
+  } catch (e) {
+    alert(e.message || "تعذر تحميل صورة الخلفية.");
+    input.value = "";
+  }
+};
+
+window.selectSiteBackground = async (preset) => {
+  if (requireOwner()) return;
+  if (preset !== "default" && !BG_PRESETS.includes(preset)) return;
+  try {
+    await update(ref(db, "branding"), {
+      backgroundPreset: preset,
+      backgroundImage: null,
+    });
+    pendingSiteBackground = "";
+    const f = document.getElementById("siteBackgroundFile");
+    if (f) f.value = "";
+    logAction(`تغيير خلفية الموقع: ${preset}`);
+    showToast("✅ تم تغيير الخلفية");
+  } catch (e) {
+    console.error(e);
+    alert("تعذر تغيير الخلفية. حاول تاني.");
+  }
+};
+
+window.saveSiteBackground = async () => {
+  if (requireOwner()) return;
+  if (!pendingSiteBackground)
+    return alert("اختار صورة واستنى المعاينة تظهر قبل الحفظ.");
+  try {
+    await update(ref(db, "branding"), {
+      backgroundPreset: "custom",
+      backgroundImage: pendingSiteBackground,
+    });
+    pendingSiteBackground = "";
+    const f = document.getElementById("siteBackgroundFile");
+    if (f) f.value = "";
+    logAction("رفع خلفية مخصصة للموقع");
+    showToast("✅ تم حفظ خلفية الموقع");
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حفظ الصورة. تحقق من اتصال قاعدة البيانات.");
+  }
+};
+
+// ---------- admin forum (group chat) ----------
+const FORUM_PATH = "adminForum/messages";
+let forumMsgs = [];
+let lastForumSend = 0;
+let _forumRenderedCount = -1;
+
+function forumIdentity(m) {
+  let name = m.name || "أدمن";
+  let photo = "";
+  let role = m.role === "owner" ? "owner" : "admin";
+  if (m.uid === "owner") {
+    name = ownerProfile.name || name;
+    photo = ownerProfile.photo;
+    role = "owner";
+  } else if (adminAccounts[m.uid]) {
+    name = adminAccounts[m.uid].name || name;
+    photo = adminAccounts[m.uid].photo;
+    role = "admin";
+  }
+  return { name, photo: safeImageSource(photo), role };
+}
+
+const forumSeenKey = () => `forumSeen_${window._currentAdmin?.id || ""}`;
+function forumTabVisible() {
+  const t = document.getElementById("tab-forum");
+  const panel = document.getElementById("adminPanel");
+  const main = document.getElementById("adminMainView");
+  return !!(
+    t &&
+    t.classList.contains("on") &&
+    panel?.style.display === "block" &&
+    main?.style.display !== "none"
+  );
+}
+
+function updateForumBadge() {
+  const badge = document.getElementById("forumBadge");
+  const me = window._currentAdmin;
+  if (!badge || !me) return;
+  const seen = Number(localStorage.getItem(forumSeenKey())) || 0;
+  const unread = forumTabVisible()
+    ? 0
+    : forumMsgs.filter((m) => m.uid !== me.id && (m.ts || 0) > seen).length;
+  badge.hidden = unread === 0;
+  badge.innerText = unread > 99 ? "99+" : String(unread);
+}
+
+function markForumSeen() {
+  if (!window._currentAdmin) return;
+  const last = forumMsgs.reduce((mx, m) => Math.max(mx, m.ts || 0), 0);
+  localStorage.setItem(forumSeenKey(), String(Math.max(last, Date.now())));
+}
+
+function renderForum(forceScroll = false) {
+  const me = window._currentAdmin;
+  const box = document.getElementById("forumMessages");
+  if (!me || !box) return;
+  if (!forumTabVisible()) {
+    updateForumBadge();
+    return;
+  }
+  if (!forumMsgs.length) {
+    box.innerHTML =
+      '<p class="admin-help" style="text-align:center;margin:auto">لسه مفيش رسائل. ابدأ أنت المحادثة 👋</p>';
+    _forumRenderedCount = 0;
+    markForumSeen();
+    updateForumBadge();
+    return;
+  }
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+  const lastIsMine = forumMsgs[forumMsgs.length - 1].uid === me.id;
+  let html = "";
+  let lastDay = "";
+  forumMsgs.forEach((m) => {
+    const d = new Date(m.ts || Date.now());
+    const day = d.toDateString();
+    if (day !== lastDay) {
+      lastDay = day;
+      html += `<div class="forum-day">${esc(d.toLocaleDateString("ar-EG", { weekday: "long", day: "numeric", month: "long" }))}</div>`;
+    }
+    const idn = forumIdentity(m);
+    const mine = m.uid === me.id;
+    const av = idn.photo
+      ? `<img class="forum-av" src="${esc(idn.photo)}" alt="">`
+      : `<span class="forum-av">${esc((idn.name || "؟").slice(0, 1))}</span>`;
+    const canDel = mine || me.role === "owner";
+    const time = d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+    html += `<div class="forum-msg ${mine ? "me" : "other"}">
+      ${av}
+      <div class="forum-bubble">
+        <div class="forum-name">${idn.role === "owner" ? '<span class="crown">👑</span>' : ""}${esc(idn.name)}</div>
+        <div class="forum-text">${esc(m.text)}</div>
+        <div class="forum-meta"><span>${esc(time)}</span>${canDel ? `<button class="forum-del" title="حذف" onclick="deleteForumMessage('${esc(m.id)}')">🗑️</button>` : ""}</div>
       </div>
-      <div style="font-size:13px;margin-bottom:6px"><b>السؤال:</b> ${esc(g.qText)}</div>
-      <div style="font-size:13px;background:var(--BG);padding:8px 10px;border-radius:9px;margin-bottom:6px"><b>إجابة الطالب:</b> ${esc(g.answer) || "—"}<br><b>الدرجة:</b> ${g.mark}/${g.maxMark} ${g.comment ? "— " + esc(g.comment) : ""}</div>
-      <div style="font-size:14px;border-right:3px solid #f9ab00;padding:6px 10px;margin-bottom:8px">⚖️ ${esc(g.text)}</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="abtn bg-purple" style="padding:6px 12px;font-size:12px" onclick="openEssayGrade('${g.examId}','${g.code}','${key}')">✍️ إعادة التصحيح</button>
-        ${done ? "" : `<button class="abtn bg-green" style="padding:6px 12px;font-size:12px" onclick="resolveGrievance('${key}')">✅ تمت المراجعة</button>`}
-        <button class="abtn bg-red" style="padding:6px 12px;font-size:12px" onclick="deleteGrievance('${key}')">🗑️</button>
-      </div></div>`;
-    })
-    .join("");
-};
-window.resolveGrievance = async (k) => {
-  await update(ref(db, `grievances/${k}`), { status: "resolved", resolvedAt: Date.now() });
-  loadAdminGrievances();
-};
-window.deleteGrievance = async (k) => {
-  if (!confirm("حذف التظلم؟")) return;
-  await remove(ref(db, `grievances/${k}`));
-  loadAdminGrievances();
-};
-function updateComplaintsBadge() {
-  const n = (window._cmpUnread || 0) + (window._grvPending || 0);
-  const tab = document.querySelector("[onclick*=\"switchTab('complaints'\"]");
-  if (tab) tab.innerText = n > 0 ? `📢 الشكاوى والتظلمات (${n})` : "📢 الشكاوى";
-}
-onValue(ref(db, "grievances"), (snap) => {
-  const d = snap.val();
-  window._grvPending = d ? Object.values(d).filter((g) => g.status !== "resolved").length : 0;
-  updateComplaintsBadge();
-});
-
-// ----- المتصلون الآن -----
-const presRef = push(ref(db, "presence"));
-const presState = { state: "visiting", name: "", exam: "" };
-window._setPresence = (patch) => {
-  Object.assign(presState, patch || {});
-  set(presRef, { ...presState, ts: Date.now() }).catch(() => {});
-};
-onValue(ref(db, ".info/connected"), (s) => {
-  if (s.val() === true) {
-    onDisconnect(presRef).remove();
-    window._setPresence({});
+    </div>`;
+  });
+  box.innerHTML = html;
+  if (forceScroll || nearBottom || lastIsMine || _forumRenderedCount < 0) {
+    box.scrollTop = box.scrollHeight;
   }
-});
-setInterval(() => window._setPresence({}), 60000);
-window.addEventListener("pagehide", () => remove(presRef).catch(() => {}));
-window._presRaw = {};
-function onlineList() {
-  const now = Date.now();
-  return Object.values(window._presRaw || {}).filter((p) => p && now - (p.ts || 0) < 180000 && p.state !== "admin");
+  _forumRenderedCount = forumMsgs.length;
+  markForumSeen();
+  updateForumBadge();
 }
-function renderOnlineBadge() {
-  const b = document.getElementById("onlineBadge");
-  if (!b) return;
-  const l = onlineList();
-  const inExam = l.filter((p) => p.state === "exam").length;
-  b.innerText = `🟢 متصل الآن: ${l.length}` + (inExam ? ` (${inExam} في امتحان)` : "");
-}
-onValue(ref(db, "presence"), (snap) => {
-  window._presRaw = snap.val() || {};
-  renderOnlineBadge();
-});
-setInterval(renderOnlineBadge, 30000);
-window.openOnlineModal = () => {
-  const l = onlineList();
-  document.getElementById("onlineBody").innerHTML = l.length
-    ? l
-        .map((p) => `<div style="padding:9px 12px;background:var(--BG);border-radius:10px;margin-bottom:6px;font-size:13px">${p.state === "exam" ? "📝" : p.state === "welcome" ? "📋" : "👀"} <b>${esc(p.name) || "زائر"}</b> — ${p.state === "exam" ? "في امتحان «" + esc(p.exam) + "»" : p.state === "welcome" ? "بيختار امتحان" : "بيتصفح الموقع"}</div>`)
-        .join("")
-    : '<p style="text-align:center;color:var(--TS);padding:16px">لا يوجد أحد متصل حالياً</p>';
-  document.getElementById("onlineModal").style.display = "flex";
+
+window.onForumTabOpened = () => {
+  renderForum(true);
+  setTimeout(() => document.getElementById("forumInput")?.focus(), 60);
 };
 
-// ----- تصميم الواجهة (قديم / جديد) + الداش بورد -----
-function getUiMode() {
-  return (window._site || {}).uiMode || "new";
-}
-function applyUiMode() {
-  document.body.classList.toggle("ui-new", getUiMode() === "new");
-  const b = document.getElementById("uiModeAdminBtn");
-  if (b) {
-    const cur = (window._site || {}).uiMode || "new";
-    b.innerText = cur === "new" ? "🖥️ تصميم الواجهة: الجديد (داش بورد) — اضغط للرجوع للقديم" : "🖥️ تصميم الواجهة: القديم (كروت) — اضغط للجديد";
+onValue(query(ref(db, FORUM_PATH), limitToLast(200)), (snap) => {
+  const v = snap.val() || {};
+  forumMsgs = Object.entries(v)
+    .map(([id, m]) => ({ id, ...m }))
+    .filter((m) => m && typeof m.text === "string")
+    .sort((a, b) => (a.ts || 0) - (b.ts || 0) || (a.id < b.id ? -1 : 1));
+  renderForum();
+});
+
+window.sendForumMessage = async () => {
+  const me = window._currentAdmin;
+  if (!me) return;
+  const input = document.getElementById("forumInput");
+  const text = input.value.trim();
+  if (!text) return;
+  if (Date.now() - lastForumSend < 600) return;
+  lastForumSend = Date.now();
+  input.value = "";
+  input.style.height = "auto";
+  try {
+    await set(push(ref(db, FORUM_PATH)), {
+      uid: me.id,
+      name: me.name,
+      role: me.role,
+      text: text.slice(0, 1000),
+      ts: serverTimestamp(),
+    });
+  } catch (e) {
+    console.error(e);
+    input.value = text;
+    alert("تعذر إرسال الرسالة. تحقق من الاتصال.");
   }
-}
-function refreshWelcomeIfOpen() {
-  const w = document.getElementById("welcomeScreen");
-  if (w && w.style.display === "block") buildExamList();
-}
-window.adminToggleUiMode = async () => {
-  const site = window._site || {};
-  const next = (site.uiMode || "new") === "new" ? "old" : "new";
-  await set(ref(db, "siteSettings"), { ...site, uiMode: next, uiVer: Date.now() });
-  showToast(next === "new" ? "✅ تم تفعيل التصميم الجديد للكل" : "✅ تم الرجوع للتصميم القديم للكل");
 };
-onValue(ref(db, "siteSettings"), (snap) => {
-  window._site = snap.val() || {};
-  applyUiMode();
-  refreshWelcomeIfOpen();
-});
-applyUiMode();
 
-function renderDashboard(visible) {
-  const open = visible.filter((e) => !e.closed && (e.questions || []).length);
-  const totalQ = visible.reduce((a, e) => a + (e.questions || []).length, 0);
-  const essayN = visible.filter((e) => (e.questions || []).some(isEssay)).length;
-  const stat = (ic, n, l) => `<div class="dash-stat"><div class="ds-ic">${ic}</div><div class="ds-n">${n}</div><div class="ds-l">${l}</div></div>`;
-  const stats = `<div class="dash-stats">${stat("🟢", open.length, "امتحان متاح")}${stat("❓", totalQ, "إجمالي الأسئلة")}${stat("✍️", essayN, "فيها مقالي")}${stat("🔒", visible.length - open.length, "مقفل / فارغ")}</div>`;
-  const tiles = visible
-    .map((ex) => {
-      const qs = ex.questions || [];
-      const cnt = qs.length;
-      const lk = ex.closed || cnt === 0;
-      const ess = qs.filter(isEssay).length;
-      return `<div class="dash-tile ${lk ? "locked" : ""}" style="--tc:${esc(ex.color || "#1a73e8")}" onclick="${lk ? "" : "startExam('" + ex.id + "')"}">
-        <div class="dt-top"><div class="dt-ic">${ex.emoji || "📝"}</div><div class="dt-status ${lk ? "off" : "on"}">${lk ? (cnt === 0 ? "فارغ" : "🔒 مقفل") : "🟢 متاح"}</div></div>
-        <div class="dt-name">${ex.pinned ? "📌 " : ""}${esc(ex.name)}${ex.password ? " 🔑" : ""}</div>
-        <div class="dt-desc">${esc(ex.desc || "")}</div>
-        <div class="dt-chips"><span>❓ ${cnt} سؤال</span><span>⏱️ ${Math.floor((ex.time || 1800) / 60)} د</span>${ess ? `<span>✍️ ${ess} مقالي</span>` : ""}<span>🎯 نجاح ${ex.passMark || 50}%</span></div>
-        <div class="dt-go">${lk ? "غير متاح الآن" : "ابدأ الامتحان ◀"}</div></div>`;
-    })
-    .join("");
-  return `<div class="dash">${stats}<div class="dash-grid">${tiles}</div></div>`;
-}
+window.deleteForumMessage = async (id) => {
+  const me = window._currentAdmin;
+  const m = forumMsgs.find((x) => x.id === id);
+  if (!me || !m) return;
+  if (m.uid !== me.id && me.role !== "owner") return;
+  if (!confirm("حذف الرسالة دي؟")) return;
+  try {
+    await remove(ref(db, `${FORUM_PATH}/${id}`));
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حذف الرسالة.");
+  }
+};
+
+window.clearForum = async () => {
+  if (requireOwner()) return;
+  if (!confirm("مسح كل رسائل المنتدى نهائياً؟")) return;
+  try {
+    await remove(ref(db, FORUM_PATH));
+    logAction("مسح رسائل منتدى الأدمن");
+  } catch (e) {
+    console.error(e);
+    alert("تعذر مسح الرسائل.");
+  }
+};
+
+(() => {
+  const input = document.getElementById("forumInput");
+  if (!input) return;
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      window.sendForumMessage();
+    }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 120) + "px";
+  });
+})();
