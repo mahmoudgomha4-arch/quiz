@@ -128,6 +128,8 @@ onValue(ref(db, "globalNotification"), (snap) => {
 onValue(ref(db, "exams"), (snap) => {
   const d = snap.val();
   exams = d ? Object.values(d) : [];
+  exams.forEach((e) => _examQCount.set(e.id, (e.questions || []).length));
+  if (typeof fillExamSelect === "function") fillExamSelect();
   renderExamsList();
   refreshStudentExamList();
   if (currentExamId) {
@@ -172,7 +174,11 @@ window.showWelcome = async () => {
     return alert("أدخل رقم هاتف صحيح (11 رقم)");
 
   studentName = name;
-  document.getElementById("wStudentName").innerText = "مرحباً، " + name;
+  saveStudentIdentity(name, phone);
+  {
+    const wn = document.getElementById("wStudentName");
+    wn.innerHTML = "مرحباً، " + esc(name) + (matchAdminByName(name) ? " " + ADMIN_BADGE : "");
+  }
   updateWelcomeBg();
   buildExamList();
   loadHonorForWelcome();
@@ -266,7 +272,24 @@ function buildExamList() {
     </div>`;
     })
     .join("");
+  highlightDeepExam();
 }
+
+function highlightDeepExam() {
+  const id = window._deepExamId;
+  if (!id) return;
+  const idx = [...exams].filter((e) => !e.archived).findIndex((e) => e.id === id);
+  const card = document.querySelectorAll("#wExamsList .w-exam-card")[idx];
+  if (!card) return;
+  card.classList.add("w-exam-highlight");
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  window._deepExamId = null;
+}
+window.setDeepExam = (id) => {
+  window._deepExamId = id;
+  const ws = document.getElementById("welcomeScreen");
+  if (ws && ws.style.display === "block") buildExamList();
+};
 
 window.startExam = async (examId) => {
   // طبّق الجدولة ثم اقرأ أحدث حالة للامتحان من قاعدة البيانات (عشان القفل يشتغل فوراً)
@@ -554,7 +577,15 @@ window.submitExam = async (auto = false) => {
     location.reload();
     return;
   }
-  const code = Math.floor(10000 + Math.random() * 90000).toString();
+  let code = "";
+  for (let tries = 0; tries < 8; tries++) {
+    code = Math.floor(10000 + Math.random() * 90000).toString();
+    try {
+      if (!(await get(ref(db, "results/" + code))).exists()) break; // الكود لازم يكون فريد
+    } catch {
+      break;
+    }
+  }
   const snap = qs.map((q) => ({
     q: q.q,
     a: [...(q.a || [])],
@@ -582,9 +613,29 @@ window.submitExam = async (auto = false) => {
     essayPending: essayIndices.length > 0,
     pendingEssayCount: essayIndices.length,
     essayScores: {},
+    submittedAt: Date.now(),
+    ...(essayIndices.length ? { essayStatus: "pending" } : {}),
   };
   await set(ref(db, `examResults/${ex.id}/${code}`), rd);
   await set(ref(db, "results/" + code), rd);
+  rememberStudentCode(code, ex.id, ex.name, rd.time);
+  if (essayIndices.length) {
+    try {
+      const nref = push(ref(db, "adminNotifications"));
+      await update(ref(db), {
+        [`essayQueue/${ex.id}__${code}`]: queueEntryFromResult(ex.id, code, rd),
+        [`adminNotifications/${nref.key}`]: {
+          type: "essay",
+          refId: `${ex.id}__${code}`,
+          title: "إجابة مقالية جديدة تحتاج تصحيح",
+          body: `${studentName} — ${ex.name}`,
+          ts: serverTimestamp(),
+        },
+      });
+    } catch (e) {
+      console.warn("essay notify failed", e);
+    }
+  }
   const badge = document.createElement("div");
   badge.className = "code-badge";
   badge.innerText = `🔑 كودك: ${code}`;
@@ -696,18 +747,27 @@ function showInlineResult(d) {
     document.getElementById("rTable").innerHTML = h;
   }
   document.getElementById("resultScreen").style.display = "block";
+  document.dispatchEvent(new CustomEvent("exam:result-shown", { detail: { d, hideScore, passed, pct } }));
 }
 
 // ===== RESULT CHECK BY CODE =====
 window.checkResult = async () => {
   const code = document.getElementById("codeInput").value.trim();
+  const chosenExam = document.getElementById("codeExamSelect")?.value || "";
   if (!code) return alert("اكتب الكود الأول");
   if (/[.#$\[\]\/]/.test(code)) return alert("❌ الكود غير صحيح");
   let d;
   try {
-    const snap = await get(ref(db, "results/" + code));
-    if (!snap.exists()) return alert("❌ الكود غير صحيح");
-    d = snap.val();
+    if (chosenExam) {
+      // اختار امتحان معيّن: ندوّر على الكود جوه نتائج الامتحان ده تحديداً
+      const snap = await get(ref(db, `examResults/${chosenExam}/${code}`));
+      if (!snap.exists()) return alert("❌ الكود ده غير مسجّل في الامتحان المختار.\nتأكد من الكود أو اختار الامتحان الصحيح.");
+      d = snap.val();
+    } else {
+      const snap = await get(ref(db, "results/" + code));
+      if (!snap.exists()) return alert("❌ الكود غير صحيح");
+      d = snap.val();
+    }
   } catch (e) {
     console.error(e);
     return alert("تعذر الاتصال بالخادم، حاول مرة أخرى.");
@@ -725,6 +785,8 @@ window.checkResult = async () => {
       "🔒 النتائج غير متاحة حالياً لهذا الامتحان.\nاحتفظ بكودك وجرّب لاحقاً بعد ما المدرس يفتح النتائج.",
     );
   }
+  // أضف الكود لقائمة الطالب المحفوظة لو لسه مش فيها
+  if (d.name && normName(d.name) === normName(readStudent().name)) rememberStudentCode(code, d.examId, d.examName, d.time);
   showInlineResult({
     ...d,
     _showCorrect: ex ? !!ex.showCorrect : false,
@@ -733,8 +795,18 @@ window.checkResult = async () => {
 };
 
 // ===== ADMIN =====
-window.showAdminAuth = () =>
-  (document.getElementById("adminAuthModal").style.display = "flex");
+window.showAdminAuth = async () => {
+  // جلسة محفوظة وصالحة؟ ادخل مباشرة بدون كلمة السر
+  try {
+    const admin = await restorePersistentSession();
+    const typed = document.getElementById("nameInput")?.value || "";
+    if (admin && normName(admin.name) === normName(typed))
+      return await openAdminSession(admin, { restored: true });
+  } catch (e) {
+    console.warn("session restore failed", e);
+  }
+  document.getElementById("adminAuthModal").style.display = "flex";
+};
 window.hideAdminAuth = () =>
   (document.getElementById("adminAuthModal").style.display = "none");
 // (تسجيل دخول الأدمن وحسابات الأدمن: انظر نهاية الملف)
@@ -752,6 +824,9 @@ window.switchTab = (id, btn) => {
   if (id === "logs") loadLogs();
   if (id === "stats") showQuickStats();
   if (id === "forum") onForumTabOpened();
+  if (id === "complaints") renderComplaints();
+  if (id === "essays") onEssayTabOpened();
+  if (id === "certs" && window.CertAdmin) window.CertAdmin.onOpen();
 };
 
 window.switchExamTab = (id, btn) => {
@@ -836,6 +911,7 @@ function applySchedules() {
     update(ref(db, `exams/${ex.id}`), patch).catch((e) =>
       console.warn("schedule update failed", e),
     );
+    if (!closed) scheduleExamAnnounce(ex.id, 2000);
   });
 }
 function refreshStudentExamList() {
@@ -1004,9 +1080,16 @@ window.saveNewExam = () => {
   logAction("إضافة امتحان: " + name);
 };
 
+const _examQCount = new Map();
 function saveExams() {
   const obj = {};
   exams.forEach((e) => (obj[e.id] = e));
+  // أول مرة الامتحان يبقى متاح (كان فاضي وأضفنا له أسئلة) → إشعار للطلاب بعد هدوء التعديل
+  exams.forEach((e) => {
+    const before = _examQCount.get(e.id);
+    if (before === 0 && (e.questions || []).length > 0 && examAnnounceable(e) && !e.announcedAt)
+      scheduleExamAnnounce(e.id);
+  });
   set(ref(db, "exams"), obj);
 }
 
@@ -1017,6 +1100,7 @@ window.examToggleClosed = () => {
   if (!ex) return;
   ex.closed = !ex.closed;
   saveExams();
+  if (!ex.closed) scheduleExamAnnounce(ex.id);
   renderExamDashboard(ex);
 };
 window.examSetPass = () => {
@@ -1087,6 +1171,7 @@ window.examDelete = () => {
   exams = exams.filter((e) => e.id !== ex.id);
   saveExams();
   remove(ref(db, `examResults/${ex.id}`));
+  purgeEssayQueue(ex.id);
   logAction("حذف امتحان: " + ex.name);
   backToExamsList();
 };
@@ -1360,109 +1445,12 @@ async function getExamResults(examId) {
   return Object.values(snap.val() || {});
 }
 
-window.loadExamResultsTab = async () => {
-  const ex = getCurEx();
-  if (!ex) return;
-  const list = (await getExamResults(ex.id)).sort((a, b) => {
-    const pa = isResultGradingComplete(a) ? 1 : 0;
-    const pb = isResultGradingComplete(b) ? 1 : 0;
-    return pa - pb || b.score - a.score; // اللي محتاج تصحيح الأول
-  });
-  const c = document.getElementById("examResultsArea");
-  if (!list.length) {
-    c.innerHTML =
-      '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد نتائج بعد</p>';
-    return;
-  }
-  let h = `<table><thead><tr><th>م</th><th>الاسم</th><th>الكود</th><th>الدرجة</th><th>النسبة</th><th>الوقت</th><th>إدارة</th></tr></thead><tbody>`;
-  list.forEach((s, i) => {
-    const pending = hasEssayQuestions(s) && !isResultGradingComplete(s);
-    const pct = s.total ? Math.round((s.score / s.total) * 100) : 0;
-    h += `<tr><td>${i + 1}</td><td>${esc(s.name)}</td><td style="font-family:monospace">${esc(s.code)}</td><td>${pending ? '<span class="essay-badge">بانتظار تصحيح المقالي</span>' : `${fmtNum(s.score)}/${fmtNum(s.total)}`}</td><td>${pending ? "—" : pct + "%"}</td><td style="font-size:11px; margin-bottom:5px;">${esc(s.time)}</td><td>${hasEssayQuestions(s) ? `<button class="abtn bg-orange" onclick="gradeEssays('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 9px;font-size:11px;margin-bottom:10px;">${pending ? "✍️ تصحيح المقالي" : "مراجعة التصحيح"}</button> ` : ""}<button class="abtn bg-red" onclick="delExamResult('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 15px;width:70%;font-size:11px">حذف</button></td></tr>`;//اخيرا لقيته حسبي الله ونعم الوكيل
-  });
-  c.innerHTML = h + "</tbody></table>";
-};
-
-window.gradeEssays = async (examId, code) => {
-  const snap = await get(ref(db, `examResults/${examId}/${code}`));
-  if (!snap.exists()) return alert("النتيجة غير موجودة");
-  const result = snap.val();
-  const essays = (result.questionsSnapshot || [])
-    .map((question, index) => ({ question, index }))
-    .filter(({ question }) => question.type === "essay");
-  if (!essays.length) return alert("لا توجد أسئلة مقالية في هذه النتيجة");
-  gradingTarget = { examId, code, result };
-  document.getElementById("essayGradeTitle").innerText =
-    `تصحيح إجابات ${result.name || "الطالب"} — ${result.examName || ""}`;
-  document.getElementById("essayGradeList").innerHTML = essays
-    .map(
-      ({ question, index }, number) => `
-        <section class="essay-grade-item">
-          <h4>السؤال ${number + 1} — الدرجة القصوى ${fmtNum(questionPoints(question))}</h4>
-          <p class="essay-grade-question">${esc(question.q)}</p>
-          <div class="essay-grade-answer">${esc(result.userAnswers?.[index] || "لم يكتب الطالب إجابة")}</div>
-          <label for="essayScore_${index}">الدرجة المستحقة</label>
-          <input class="essay-score-input" id="essayScore_${index}" data-index="${index}"
-            type="number" min="0" max="${questionPoints(question)}" step="0.5"
-            value="${Number(result.essayScores?.[index] ?? 0)}" />
-        </section>`,
-    )
-    .join("");
-  document.getElementById("essayGradeModal").style.display = "flex";
-};
-
-window.saveEssayGrades = async () => {
-  if (!gradingTarget) return;
-  const { examId, code, result } = gradingTarget;
-  const essayScores = { ...(result.essayScores || {}) };
-  for (const input of document.querySelectorAll(".essay-score-input")) {
-    const index = Number(input.dataset.index);
-    const question = result.questionsSnapshot[index];
-    const points = Number(input.value);
-    if (!Number.isFinite(points) || points < 0 || points > questionPoints(question)) {
-      return alert(`الدرجة لازم تكون من 0 إلى ${questionPoints(question)}`);
-    }
-    essayScores[index] = points;
-  }
-  let score = 0;
-  let total = 0;
-  (result.questionsSnapshot || []).forEach((question, index) => {
-    const points = questionPoints(question);
-    total += points;
-    if (question.type === "essay") score += Number(essayScores[index]) || 0;
-    else if (result.userAnswers?.[index] === question.c) score += points;
-  });
-  const passMark = result.passMark || 50;
-  const pct = total ? Math.round((score / total) * 100) : 0;
-  const patch = {
-    score,
-    total,
-    essayScores,
-    essayGraded: true,
-    essayPending: false,
-    pendingEssayCount: 0,
-    passed: pct >= passMark,
-    gradedAt: new Date().toLocaleString("ar-EG"),
-  };
-  try {
-    await Promise.all([
-      update(ref(db, `examResults/${examId}/${code}`), patch),
-      update(ref(db, `results/${code}`), patch),
-    ]);
-  } catch (e) {
-    console.error(e);
-    return alert("تعذر حفظ التصحيح. تحقق من الاتصال وحاول تاني.");
-  }
-  closeModal("essayGradeModal");
-  gradingTarget = null;
-  logAction(`تصحيح مقالي: ${result.name} (${fmtNum(score)}/${fmtNum(total)})`);
-  if (getCurEx()?.id === examId) await loadExamResultsTab();
-  alert("تم حفظ التصحيح، وأصبحت النتيجة متاحة للطالب.");
-};
+// (تصحيح المقالي وجدول النتائج بالحالات: انظر نهاية الملف)
 window.delExamResult = async (examId, code) => {
   if (!confirm("حذف؟")) return;
   await remove(ref(db, `examResults/${examId}/${code}`));
   await remove(ref(db, "results/" + code));
+  remove(ref(db, `essayQueue/${examId}__${code}`)).catch(() => {});
   loadExamResultsTab();
 };
 
@@ -1947,6 +1935,7 @@ window.resetAllResults = () => {
   Promise.all([
     remove(ref(db, "results")),
     remove(ref(db, "examResults")),
+    remove(ref(db, "essayQueue")),
   ]).then(() => {
     alert("✅ تم التصفير");
     logAction("تصفير كل النتائج");
@@ -2251,6 +2240,7 @@ window.examResetResults = async () => {
   if (!confirm(`تصفير كل نتائج "${ex.name}"؟ هذا الإجراء لا يمكن التراجع عنه.`))
     return;
   await remove(ref(db, `examResults/${ex.id}`));
+  purgeEssayQueue(ex.id);
   logAction("تصفير نتائج: " + ex.name);
   alert("✅ تم تصفير نتائج هذا الامتحان");
 };
@@ -3030,7 +3020,18 @@ window.sendComplaint = async () => {
   };
 
   try {
-    await push(ref(db, "complaints"), complaint);
+    const cref = push(ref(db, "complaints"));
+    const nref = push(ref(db, "adminNotifications"));
+    await update(ref(db), {
+      [`complaints/${cref.key}`]: complaint,
+      [`adminNotifications/${nref.key}`]: {
+        type: "complaint",
+        refId: cref.key,
+        title: "شكوى جديدة",
+        body: `${complaint.name}: ${text.slice(0, 80)}`,
+        ts: serverTimestamp(),
+      },
+    });
     closeModal("complaintModal");
     alert("✅ تم إرسال شكواك بنجاح. سيتم مراجعتها من قِبل الأستاذ.");
   } catch (e) {
@@ -3038,79 +3039,7 @@ window.sendComplaint = async () => {
   }
 };
 
-window.loadAdminComplaints = async () => {
-  const c = document.getElementById("complaintsContainer");
-  c.innerHTML =
-    '<p style="color:var(--TS);text-align:center;padding:20px">جاري التحميل...</p>';
-  const snap = await get(ref(db, "complaints"));
-  const data = snap.val();
-  if (!data) {
-    c.innerHTML =
-      '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد شكاوى حتى الآن</p>';
-    return;
-  }
-  const list = Object.entries(data).sort(
-    (a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0),
-  );
-  c.innerHTML = list
-    .map(
-      ([key, r]) => `
-    <div style="background:var(--CB);border:1.5px solid ${r.read ? "var(--BR)" : "#d63031"};border-radius:16px;padding:16px;margin-bottom:10px;box-shadow:var(--SH)">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px">
-        <div>
-          <div style="font-size:15px;font-weight:800;color:var(--TX)">👤 ${r.name}</div>
-          <div style="font-size:12px;color:var(--TS);margin-top:2px">📱 <span id="phone_${key}" style="font-family:monospace">••••••</span>
-            <button onclick="toggleAdminPhone('${key}','${(r.phone || "").replace(/'/g, "\\'")}',this)" style="background:var(--IB);border:1px solid var(--BR);border-radius:6px;padding:1px 7px;cursor:pointer;font-size:10px;font-family:'Cairo',sans-serif;font-weight:700;color:var(--TS);margin-right:4px;transition:.2s">إظهار</button>
-          </div>
-        </div>
-        <div style="font-size:11px;color:var(--TS);text-align:left">${r.time || ""}</div>
-      </div>
-      <div style="background:var(--BG);border-radius:12px;padding:12px;font-size:14px;line-height:1.7;color:var(--TX);border-right:3px solid #d63031;margin-bottom:10px">${r.text}</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="abtn bg-green" onclick="markComplaintRead('${key}')" style="padding:6px 12px;font-size:12px">✅ تم الاطلاع</button>
-        <button class="abtn bg-red" onclick="deleteComplaint('${key}')" style="padding:6px 12px;font-size:12px">🗑️ حذف</button>
-      </div>
-    </div>
-  `,
-    )
-    .join("");
-};
-
-window.toggleAdminPhone = (key, phone, btn) => {
-  const el = document.getElementById("phone_" + key);
-  if (el.innerText.includes("•")) {
-    el.innerText = phone || "غير متاح";
-    btn.innerText = "إخفاء";
-  } else {
-    el.innerText = "••••••";
-    btn.innerText = "إظهار";
-  }
-};
-
-window.markComplaintRead = async (key) => {
-  await update(ref(db, `complaints/${key}`), { read: true });
-  loadAdminComplaints();
-};
-window.deleteComplaint = async (key) => {
-  if (!confirm("حذف الشكوى؟")) return;
-  await remove(ref(db, `complaints/${key}`));
-  loadAdminComplaints();
-};
-window.clearAllComplaints = async () => {
-  if (!confirm("⚠️ حذف كل الشكاوى نهائياً؟")) return;
-  await remove(ref(db, "complaints"));
-  loadAdminComplaints();
-};
-
-// ===== COMPLAINTS LISTENER (badge for admin) =====
-onValue(ref(db, "complaints"), (snap) => {
-  const data = snap.val();
-  const unread = data ? Object.values(data).filter((c) => !c.read).length : 0;
-  const tab = document.querySelector(
-    "[onclick=\"switchTab('complaints',this)\"]",
-  );
-  if (tab) tab.innerText = unread > 0 ? `📢 الشكاوى (${unread})` : "📢 الشكاوى";
-});
+// (إدارة الشكاوى للأدمن + الإشعارات: انظر نهاية الملف — حالة القراءة لكل أدمن على حدة)
 
 // ===== AI EXTRACT =====
 let aiExtractedQs = [];
@@ -3489,8 +3418,13 @@ window.checkAdminAuth = async () => {
   if (!p) return;
   _authBusy = true;
   try {
+    const typedName = document.getElementById("nameInput")?.value || "";
+    const nameOk = (adminName) => normName(adminName) === normName(typedName);
     const { rec, cred } = await getOwnerRecord();
     if (await verifyPassword(p, cred)) {
+      if (!nameOk(rec.name || ownerProfile.name)) {
+        return alert("اكتب اسمك في خانة الاسم بالظبط زي ما هو مكتوب في حساب الأدمن، وبعدين كلمة السر.");
+      }
       _authFails = 0;
       await openAdminSession({
         id: "owner",
@@ -3505,6 +3439,9 @@ window.checkAdminAuth = async () => {
       if (!(await verifyPassword(p, acctCred(a)))) continue;
       if (a.active === false) {
         return alert("حساب الأدمن ده متعطّل. كلّم المالك.");
+      }
+      if (!nameOk(a.name)) {
+        return alert("اكتب اسمك في خانة الاسم بالظبط زي ما هو مكتوب في حساب الأدمن، وبعدين كلمة السر.");
       }
       _authFails = 0;
       await openAdminSession({ id, role: "admin", name: a.name, photo: a.photo });
@@ -3524,7 +3461,7 @@ window.checkAdminAuth = async () => {
   }
 };
 
-async function openAdminSession(admin) {
+async function openAdminSession(admin, opts = {}) {
   window._currentAdmin = {
     id: admin.id,
     role: admin.role,
@@ -3545,13 +3482,24 @@ async function openAdminSession(admin) {
   const firstTab = document.querySelector("#adminMainView .atab");
   if (firstTab) window.switchTab("exams", firstTab);
   renderForum();
-  logAction("دخول لوحة التحكم");
+  startAdminRealtime();
+  if (opts.restored) {
+    watchOwnSession();
+  } else {
+    logAction("دخول لوحة التحكم");
+    createPersistentSession(window._currentAdmin).catch((e) =>
+      console.warn("persist session failed", e),
+    );
+  }
+  document.dispatchEvent(new CustomEvent("admin:session-start", { detail: window._currentAdmin }));
 }
 
 window.closeAdminPanel = () => {
+  stopAdminRealtime();
   document.getElementById("adminPanel").style.display = "none";
   document.body.classList.remove("is-admin", "owner-admin");
   window._currentAdmin = null;
+  document.dispatchEvent(new CustomEvent("admin:session-end"));
 };
 
 function updateAdminIdentity(fillProfile = false) {
@@ -3588,6 +3536,7 @@ window.openMyAccountTab = () => {
 // ---------- live data ----------
 onValue(ref(db, "adminAccounts"), (snap) => {
   adminAccounts = snap.val() || {};
+  if (typeof refreshAdminEntry === "function") refreshAdminEntry();
   renderAdminAccounts();
   const me = window._currentAdmin;
   if (me && me.role === "admin") {
@@ -3613,6 +3562,7 @@ onValue(ref(db, "adminProfiles/owner"), (snap) => {
     name: v.name || "مالك الموقع",
     photo: safeImageSource(v.photo),
   };
+  if (typeof refreshAdminEntry === "function") refreshAdminEntry();
   if (window._currentAdmin?.id === "owner") {
     window._currentAdmin = { ...window._currentAdmin, ...ownerProfile };
     updateAdminIdentity();
@@ -3714,6 +3664,7 @@ window.resetAdminPassword = async (id) => {
       passwordSalt: cred.salt,
       passwordHash: cred.hash,
     });
+    revokeAdminSessions(id);
     logAction(`تغيير كلمة سر الأدمن: ${acc.name}`);
     showToast("✅ تم تغيير كلمة السر");
   } catch (e) {
@@ -3728,6 +3679,7 @@ window.toggleAdminAccount = async (id) => {
   if (!acc) return;
   try {
     await update(ref(db, `adminAccounts/${id}`), { active: acc.active === false });
+    if (acc.active !== false) revokeAdminSessions(id);
     logAction(`${acc.active === false ? "تفعيل" : "تعطيل"} حساب الأدمن: ${acc.name}`);
   } catch (e) {
     console.error(e);
@@ -3741,6 +3693,7 @@ window.deleteAdminAccount = async (id) => {
   if (!acc || !confirm(`حذف حساب الأدمن "${acc.name}" نهائياً؟`)) return;
   try {
     await remove(ref(db, `adminAccounts/${id}`));
+    revokeAdminSessions(id);
     logAction(`حذف حساب الأدمن: ${acc.name}`);
   } catch (e) {
     console.error(e);
@@ -3810,6 +3763,7 @@ window.changeMyPassword = async () => {
       return alert("كلمة السر دي مستخدمة بالفعل. اختار كلمة سر مختلفة.");
     const n = await makePasswordHash(newPw);
     await update(ref(db, path), { passwordSalt: n.salt, passwordHash: n.hash });
+    revokeAdminSessions(me.id, readSavedSession()?.sid); // سجّل خروج باقي الأجهزة
     ["myOldPass", "myNewPass", "myNewPass2"].forEach(
       (id) => (document.getElementById(id).value = ""),
     );
@@ -3907,6 +3861,15 @@ const FORUM_PATH = "adminForum/messages";
 let forumMsgs = [];
 let lastForumSend = 0;
 let _forumRenderedCount = -1;
+const _forumPendingReceipts = new Set();
+const _forumSeenIds = new Set();
+let _forumFirstSnapshot = true;
+const _forumReceiptOpen = new Set();
+
+const TICK_ONE =
+  '<svg viewBox="0 0 16 11" width="16" height="11" aria-hidden="true"><path d="M1.5 5.8l3.6 3.6L12.5 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const TICK_TWO =
+  '<svg viewBox="0 0 21 11" width="21" height="11" aria-hidden="true"><path d="M1.5 5.8l3.6 3.6L12 2M8 8.6l.8.8L19 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 function forumIdentity(m) {
   let name = m.name || "أدمن";
@@ -3924,7 +3887,47 @@ function forumIdentity(m) {
   return { name, photo: safeImageSource(photo), role };
 }
 
-const forumSeenKey = () => `forumSeen_${window._currentAdmin?.id || ""}`;
+const adminNameById = (id) =>
+  id === "owner"
+    ? ownerProfile.name || "مالك الموقع"
+    : adminAccounts[id]?.name || "أدمن";
+
+// المستلمون = كل الأدمنز الفعّالين ما عدا صاحب الرسالة
+function forumRecipients(m) {
+  const ids = [
+    "owner",
+    ...Object.keys(adminAccounts || {}).filter((id) => adminAccounts[id]?.active !== false),
+  ];
+  return ids.filter((id) => id !== m.uid);
+}
+
+// حالة الرسالة من الـ database: sent ✓ | delivered ✓✓ | read ✓✓ (أزرق)
+function forumReceipt(m) {
+  const rcp = forumRecipients(m);
+  const dl = m.deliveredTo || {};
+  const rd = m.readBy || {};
+  const readers = rcp.filter((id) => rd[id]);
+  const got = rcp.filter((id) => dl[id] || rd[id]);
+  // ✓ أُرسلت | ✓✓ رمادي: وصلت لأدمن واحد على الأقل | ✓✓ أزرق: قرأها أدمن واحد على الأقل
+  // (التفاصيل بتوضح مين قرأ ومين لسه — عشان أدمن غير نشط ما يعطّلش العلامة)
+  let state = "sent";
+  if (readers.length > 0) state = "read";
+  else if (got.length > 0) state = "delivered";
+  return {
+    state,
+    total: rcp.length,
+    readCount: readers.length,
+    readers: readers.map(adminNameById),
+    waiting: rcp.filter((id) => !rd[id]).map(adminNameById),
+  };
+}
+
+function forumReceiptLabel(r) {
+  if (r.state === "read") return "تمت القراءة";
+  if (r.state === "delivered") return "تم التسليم";
+  return "تم الإرسال";
+}
+
 function forumTabVisible() {
   const t = document.getElementById("tab-forum");
   const panel = document.getElementById("adminPanel");
@@ -3937,23 +3940,66 @@ function forumTabVisible() {
   );
 }
 
+function forumUnreadFor(me) {
+  const since = effectiveSince();
+  return forumMsgs.filter(
+    (m) => m.uid !== me.id && !(m.readBy && m.readBy[me.id]) && (m.ts || Date.now()) >= since,
+  );
+}
+
 function updateForumBadge() {
   const badge = document.getElementById("forumBadge");
   const me = window._currentAdmin;
   if (!badge || !me) return;
-  const seen = Number(localStorage.getItem(forumSeenKey())) || 0;
-  const unread = forumTabVisible()
-    ? 0
-    : forumMsgs.filter((m) => m.uid !== me.id && (m.ts || 0) > seen).length;
+  const unread =
+    forumTabVisible() && document.visibilityState !== "hidden" ? 0 : forumUnreadFor(me).length;
   badge.hidden = unread === 0;
   badge.innerText = unread > 99 ? "99+" : String(unread);
 }
 
-function markForumSeen() {
-  if (!window._currentAdmin) return;
-  const last = forumMsgs.reduce((mx, m) => Math.max(mx, m.ts || 0), 0);
-  localStorage.setItem(forumSeenKey(), String(Math.max(last, Date.now())));
+// كتابة إيصالات الاستلام/القراءة الخاصة بهذا الأدمن فقط داخل كل رسالة
+function pushForumReceipts(kind, msgs) {
+  const me = window._currentAdmin;
+  if (!me || !msgs.length) return;
+  const upd = {};
+  msgs.forEach((m) => {
+    const k = `${m.id}:${kind}:${me.id}`;
+    if (_forumPendingReceipts.has(k)) return;
+    _forumPendingReceipts.add(k);
+    upd[`${FORUM_PATH}/${m.id}/${kind}/${me.id}`] = serverTimestamp();
+  });
+  if (!Object.keys(upd).length) return;
+  update(ref(db), upd).catch((e) => {
+    console.warn("forum receipt failed", e);
+    msgs.forEach((m) => _forumPendingReceipts.delete(`${m.id}:${kind}:${me.id}`));
+  });
 }
+
+function markForumDelivered() {
+  const me = window._currentAdmin;
+  if (!me) return;
+  pushForumReceipts(
+    "deliveredTo",
+    forumMsgs.filter(
+      (m) => m.uid !== me.id && !(m.deliveredTo && m.deliveredTo[me.id]) && !(m.readBy && m.readBy[me.id]),
+    ),
+  );
+}
+
+function markForumRead() {
+  const me = window._currentAdmin;
+  if (!me || !forumTabVisible() || document.visibilityState === "hidden") return;
+  pushForumReceipts(
+    "readBy",
+    forumMsgs.filter((m) => m.uid !== me.id && !(m.readBy && m.readBy[me.id])),
+  );
+}
+
+window.toggleForumReceipt = (id) => {
+  if (_forumReceiptOpen.has(id)) _forumReceiptOpen.delete(id);
+  else _forumReceiptOpen.add(id);
+  renderForum();
+};
 
 function renderForum(forceScroll = false) {
   const me = window._currentAdmin;
@@ -3967,14 +4013,16 @@ function renderForum(forceScroll = false) {
     box.innerHTML =
       '<p class="admin-help" style="text-align:center;margin:auto">لسه مفيش رسائل. ابدأ أنت المحادثة 👋</p>';
     _forumRenderedCount = 0;
-    markForumSeen();
+    markForumRead();
     updateForumBadge();
     return;
   }
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
   const lastIsMine = forumMsgs[forumMsgs.length - 1].uid === me.id;
+  const since = effectiveSince();
   let html = "";
   let lastDay = "";
+  let dividerShown = false;
   forumMsgs.forEach((m) => {
     const d = new Date(m.ts || Date.now());
     const day = d.toDateString();
@@ -3984,17 +4032,37 @@ function renderForum(forceScroll = false) {
     }
     const idn = forumIdentity(m);
     const mine = m.uid === me.id;
+    if (!mine && !dividerShown && !(m.readBy && m.readBy[me.id]) && (m.ts || Date.now()) >= since) {
+      dividerShown = true;
+      html += '<div class="forum-unread-divider"><span>رسائل جديدة</span></div>';
+    }
     const av = idn.photo
       ? `<img class="forum-av" src="${esc(idn.photo)}" alt="">`
       : `<span class="forum-av">${esc((idn.name || "؟").slice(0, 1))}</span>`;
     const canDel = mine || me.role === "owner";
     const time = d.toLocaleTimeString("ar-EG", { hour: "2-digit", minute: "2-digit" });
+    let ticks = "";
+    let detail = "";
+    if (mine) {
+      const r = forumReceipt(m);
+      const tip = `${forumReceiptLabel(r)}${r.total ? ` (${r.readCount}/${r.total} قرأوها)` : ""}`;
+      ticks = `<button type="button" class="forum-ticks ${r.state}" title="${esc(tip)}" aria-label="${esc(tip)}" onclick="toggleForumReceipt('${esc(m.id)}')">${r.state === "sent" ? TICK_ONE : TICK_TWO}</button>`;
+      if (_forumReceiptOpen.has(m.id)) {
+        detail = `<div class="forum-receipt-detail">
+          <div><b>${forumReceiptLabel(r)}</b>${r.total ? ` · ${r.readCount}/${r.total}` : ""}</div>
+          ${r.readers.length ? `<div class="ok">قرأها: ${r.readers.map(esc).join("، ")}</div>` : ""}
+          ${r.waiting.length ? `<div class="wait">لم يقرأها بعد: ${r.waiting.map(esc).join("، ")}</div>` : ""}
+          ${!r.total ? "<div>لا يوجد أدمن آخر حالياً.</div>" : ""}
+        </div>`;
+      }
+    }
     html += `<div class="forum-msg ${mine ? "me" : "other"}">
       ${av}
       <div class="forum-bubble">
         <div class="forum-name">${idn.role === "owner" ? '<span class="crown">👑</span>' : ""}${esc(idn.name)}</div>
         <div class="forum-text">${esc(m.text)}</div>
-        <div class="forum-meta"><span>${esc(time)}</span>${canDel ? `<button class="forum-del" title="حذف" onclick="deleteForumMessage('${esc(m.id)}')">🗑️</button>` : ""}</div>
+        <div class="forum-meta"><span>${esc(time)}</span>${ticks}${canDel ? `<button class="forum-del" title="حذف" onclick="deleteForumMessage('${esc(m.id)}')">🗑️</button>` : ""}</div>
+        ${detail}
       </div>
     </div>`;
   });
@@ -4003,7 +4071,7 @@ function renderForum(forceScroll = false) {
     box.scrollTop = box.scrollHeight;
   }
   _forumRenderedCount = forumMsgs.length;
-  markForumSeen();
+  markForumRead();
   updateForumBadge();
 }
 
@@ -4018,7 +4086,31 @@ onValue(query(ref(db, FORUM_PATH), limitToLast(200)), (snap) => {
     .map(([id, m]) => ({ id, ...m }))
     .filter((m) => m && typeof m.text === "string")
     .sort((a, b) => (a.ts || 0) - (b.ts || 0) || (a.id < b.id ? -1 : 1));
+  const me = window._currentAdmin;
+  if (me) {
+    // رسالة جديدة من أدمن آخر وأنا مش فاتح المنتدى → تنبيه فوري
+    forumMsgs.forEach((m) => {
+      if (_forumSeenIds.has(m.id)) return;
+      _forumSeenIds.add(m.id);
+      if (_forumFirstSnapshot || m.uid === me.id) return;
+      if (forumTabVisible() && document.visibilityState !== "hidden") return;
+      showToast(`💬 ${forumIdentity(m).name}: ${m.text.slice(0, 40)}`);
+      playSound("ans");
+    });
+    markForumDelivered();
+  } else {
+    forumMsgs.forEach((m) => _forumSeenIds.add(m.id));
+  }
+  _forumFirstSnapshot = false;
   renderForum();
+  refreshAdminBadges();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    markForumRead();
+    updateForumBadge();
+  }
 });
 
 window.sendForumMessage = async () => {
@@ -4085,4 +4177,1305 @@ window.clearForum = async () => {
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 120) + "px";
   });
+})();
+
+// ======================================================================
+//  Persistent admin session (token آمن — لا يتم حفظ كلمة السر أبداً)
+// ======================================================================
+const SESSION_KEY = "examAdminSession.v1";
+const SESSION_TTL = 30 * 24 * 3600 * 1000; // 30 يوم (تتجدد تلقائياً)
+
+async function sha256B64(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return base64FromBytes(new Uint8Array(buf));
+}
+function newSessionToken() {
+  return base64FromBytes(crypto.getRandomValues(new Uint8Array(32)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+function readSavedSession() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SESSION_KEY) || "null");
+    return s && s.id && s.sid && s.token ? s : null;
+  } catch {
+    return null;
+  }
+}
+function clearSavedSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch {}
+}
+
+let _sessionUnsub = null;
+function watchOwnSession() {
+  if (_sessionUnsub) _sessionUnsub();
+  const s = readSavedSession();
+  if (!s) return;
+  let seen = false;
+  _sessionUnsub = onValue(ref(db, `adminSessions/${s.id}/${s.sid}`), (snap) => {
+    if (snap.exists()) {
+      seen = true;
+      return;
+    }
+    // الجلسة اتلغت من جهاز تاني أو من المالك → اخرج فوراً
+    if (seen && window._currentAdmin) {
+      clearSavedSession();
+      window.closeAdminPanel();
+      alert("تم إنهاء جلسة الدخول بتاعتك. سجّل الدخول من جديد.");
+      document.getElementById("adminAuthModal").style.display = "flex";
+    }
+  });
+}
+
+async function createPersistentSession(admin) {
+  if (!window.crypto || !crypto.subtle) return;
+  const token = newSessionToken();
+  const sref = push(ref(db, `adminSessions/${admin.id}`));
+  const now = Date.now();
+  await set(sref, {
+    h: await sha256B64(token),
+    created: now,
+    expires: now + SESSION_TTL,
+    ua: String(navigator.userAgent || "").slice(0, 120),
+  });
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ id: admin.id, sid: sref.key, token }));
+  } catch (e) {
+    console.warn("تعذر حفظ الجلسة على الجهاز", e);
+    return;
+  }
+  watchOwnSession();
+  // تنظيف الجلسات المنتهية الخاصة بنفس الحساب
+  try {
+    const all = (await get(ref(db, `adminSessions/${admin.id}`))).val() || {};
+    const upd = {};
+    Object.entries(all).forEach(([sid, v]) => {
+      if (!v || (v.expires || 0) < now) upd[`adminSessions/${admin.id}/${sid}`] = null;
+    });
+    if (Object.keys(upd).length) await update(ref(db), upd);
+  } catch {}
+}
+
+async function restorePersistentSession() {
+  const s = readSavedSession();
+  if (!s || !window.crypto || !crypto.subtle) return null;
+  try {
+    const rec = (await get(ref(db, `adminSessions/${s.id}/${s.sid}`))).val();
+    if (!rec || (rec.expires || 0) < Date.now() || rec.h !== (await sha256B64(s.token))) {
+      clearSavedSession();
+      return null;
+    }
+    let admin;
+    if (s.id === "owner") {
+      const { rec: o } = await getOwnerRecord();
+      admin = { id: "owner", role: "owner", name: o.name || ownerProfile.name, photo: o.photo || "" };
+    } else {
+      const a = (await get(ref(db, `adminAccounts/${s.id}`))).val();
+      if (!a || a.active === false) {
+        clearSavedSession();
+        return null;
+      }
+      admin = { id: s.id, role: "admin", name: a.name, photo: a.photo };
+    }
+    if ((rec.expires || 0) - Date.now() < SESSION_TTL / 2) {
+      update(ref(db, `adminSessions/${s.id}/${s.sid}`), { expires: Date.now() + SESSION_TTL }).catch(() => {});
+    }
+    return admin;
+  } catch (e) {
+    // مشكلة اتصال: نسيب الجلسة المحفوظة ونطلب تسجيل الدخول العادي
+    console.warn("session restore failed", e);
+    return null;
+  }
+}
+
+async function destroyPersistentSession() {
+  const s = readSavedSession();
+  clearSavedSession();
+  if (_sessionUnsub) {
+    _sessionUnsub();
+    _sessionUnsub = null;
+  }
+  if (s) {
+    try {
+      await remove(ref(db, `adminSessions/${s.id}/${s.sid}`));
+    } catch (e) {
+      console.warn("remove session failed", e);
+    }
+  }
+}
+
+// إبطال كل جلسات حساب معيّن (عند تغيير كلمة السر/التعطيل/الحذف)
+function revokeAdminSessions(id, exceptSid) {
+  return get(ref(db, `adminSessions/${id}`))
+    .then((snap) => {
+      const upd = {};
+      Object.keys(snap.val() || {}).forEach((sid) => {
+        if (sid !== exceptSid) upd[`adminSessions/${id}/${sid}`] = null;
+      });
+      return Object.keys(upd).length ? update(ref(db), upd) : null;
+    })
+    .catch((e) => console.warn("revoke sessions failed", e));
+}
+
+window.adminLogout = async () => {
+  if (!window._currentAdmin) return;
+  if (!confirm("تسجيل الخروج من لوحة التحكم؟\nهتحتاج كلمة السر عشان تدخل تاني.")) return;
+  logAction("تسجيل خروج");
+  await destroyPersistentSession();
+  window.closeAdminPanel();
+  const inp = document.getElementById("adminPassInput");
+  if (inp) inp.value = "";
+  document.getElementById("adminAuthModal").style.display = "flex";
+};
+
+// ======================================================================
+//  Admin real-time core: per-admin read state + notifications + badges
+// ======================================================================
+let adminReads = {};
+let complaintsData = {};
+let adminNotifs = [];
+let essayQueue = {};
+let _rtUnsubs = [];
+let _rtSinceFallback = 0;
+let _sinceWriting = false;
+const _notifSeen = new Set();
+let _notifFirst = true;
+const effectiveSince = () => Number(adminReads.since) || _rtSinceFallback || 0;
+
+function setBadge(id, n) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.hidden = !(n > 0);
+  el.textContent = n > 99 ? "99+" : String(n);
+}
+
+const complaintIsRead = (key, c) => c.read === true || !!(adminReads.complaints && adminReads.complaints[key]);
+const unreadComplaintKeys = () =>
+  Object.entries(complaintsData)
+    .filter(([k, c]) => c && !complaintIsRead(k, c))
+    .map(([k]) => k);
+
+const notifAlive = (n) => n.type !== "complaint" || !!complaintsData[n.refId];
+const unreadNotifs = () => {
+  const since = effectiveSince();
+  return adminNotifs.filter(
+    (n) => notifAlive(n) && (n.ts || Date.now()) >= since && !(adminReads.notifications && adminReads.notifications[n.id]),
+  );
+};
+
+function refreshAdminBadges() {
+  const me = window._currentAdmin;
+  if (!me) return;
+  const nNotif = unreadNotifs().length;
+  setBadge("complaintsBadge", unreadComplaintKeys().length);
+  setBadge("notifBellCount", nNotif);
+  document.getElementById("notifBell")?.classList.toggle("has-unread", nNotif > 0);
+  setBadge("essayQueueBadge", essayAttentionCount());
+  updateForumBadge();
+  document.title = (nNotif > 0 ? `(${nNotif}) ` : "") + document.title.replace(/^\(\d+\)\s/, "");
+}
+
+function clearAdminBadges() {
+  ["complaintsBadge", "notifBellCount", "essayQueueBadge", "forumBadge"].forEach((id) => setBadge(id, 0));
+  document.getElementById("notifBell")?.classList.remove("has-unread");
+  document.title = document.title.replace(/^\(\d+\)\s/, "");
+}
+
+const NOTIF_ICONS = { complaint: "📢", essay: "✍️" };
+const notifIcon = (t) => NOTIF_ICONS[t] || "🔔";
+
+function timeAgo(ts) {
+  const s = Math.max(0, Math.round((Date.now() - (Number(ts) || Date.now())) / 1000));
+  if (s < 45) return "الآن";
+  if (s < 3600) return `منذ ${Math.max(1, Math.round(s / 60))} د`;
+  if (s < 86400) return `منذ ${Math.round(s / 3600)} س`;
+  return new Date(ts).toLocaleDateString("ar-EG", { day: "numeric", month: "short" });
+}
+
+function renderNotifPanel() {
+  const list = document.getElementById("notifList");
+  if (!list) return;
+  const me = window._currentAdmin;
+  if (!me) return;
+  const since = effectiveSince();
+  const items = adminNotifs.filter(notifAlive).slice().sort((a, b) => (b.ts || 0) - (a.ts || 0)).slice(0, 50);
+  if (!items.length) {
+    list.innerHTML = '<div class="notif-empty">لا توجد إشعارات حتى الآن 🎉</div>';
+    return;
+  }
+  list.innerHTML = items
+    .map((n) => {
+      const unread = (n.ts || Date.now()) >= since && !(adminReads.notifications && adminReads.notifications[n.id]);
+      return `<button type="button" class="notif-item ${unread ? "unread" : ""}" onclick="openNotification('${esc(n.id)}')">
+        <span class="notif-ic">${notifIcon(n.type)}</span>
+        <span class="notif-txt"><b>${esc(n.title || "إشعار")}</b><small>${esc(n.body || "")}</small></span>
+        <span class="notif-time">${esc(timeAgo(n.ts))}${unread ? '<i class="notif-dot-s"></i>' : ""}</span>
+      </button>`;
+    })
+    .join("");
+}
+
+window.toggleNotifPanel = (force) => {
+  const p = document.getElementById("notifPanel");
+  if (!p) return;
+  const open = typeof force === "boolean" ? force : p.hidden;
+  p.hidden = !open;
+  if (open) renderNotifPanel();
+};
+document.addEventListener("click", (e) => {
+  const p = document.getElementById("notifPanel");
+  if (p && !p.hidden && !e.target.closest(".notif-wrap")) p.hidden = true;
+});
+
+function markNotifsRead(ids) {
+  const me = window._currentAdmin;
+  if (!me || !ids.length) return Promise.resolve();
+  const upd = {};
+  ids.forEach((id) => (upd[`adminReads/${me.id}/notifications/${id}`] = serverTimestamp()));
+  return update(ref(db), upd).catch((e) => console.warn("mark notif read failed", e));
+}
+
+window.markAllNotificationsRead = () => {
+  const ids = unreadNotifs().map((n) => n.id);
+  // الشكاوى المرتبطة تتعلّم كمقروءة لهذا الأدمن أيضاً؟ لا — الشكوى تُقرأ بفتحها فقط
+  const me = window._currentAdmin;
+  if (!me || !ids.length) return;
+  markNotifsRead(ids);
+};
+
+function goToAdminTab(id) {
+  if (currentExamId) window.backToExamsList();
+  const btn = document.getElementById(id + "TabBtn");
+  if (btn) window.switchTab(id, btn);
+}
+
+window.openNotification = async (id) => {
+  const n = adminNotifs.find((x) => x.id === id);
+  window.toggleNotifPanel(false);
+  if (!n) return;
+  if (n.type === "complaint") {
+    if (!complaintsData[n.refId]) {
+      showToast("الشكوى دي اتحذفت");
+      return markNotifsRead([id]);
+    }
+    goToAdminTab("complaints");
+    _openComplaints.add(n.refId);
+    renderComplaints();
+    markComplaintReadForMe(n.refId);
+    setTimeout(() => document.getElementById("cmp_" + n.refId)?.scrollIntoView({ behavior: "smooth", block: "center" }), 80);
+    return;
+  }
+  await markNotifsRead([id]);
+  if (n.type === "essay") {
+    goToAdminTab("essays");
+    const [examId, code] = String(n.refId || "").split("__");
+    if (examId && code) window.gradeEssays(examId, code);
+  }
+};
+
+function handleNewNotifs() {
+  const me = window._currentAdmin;
+  if (!me) return;
+  if (_notifFirst) {
+    adminNotifs.forEach((n) => _notifSeen.add(n.id));
+    _notifFirst = false;
+    return;
+  }
+  adminNotifs.forEach((n) => {
+    if (_notifSeen.has(n.id)) return;
+    _notifSeen.add(n.id);
+    if (!notifAlive(n)) return;
+    showToast(`${notifIcon(n.type)} ${n.title || "إشعار جديد"}${n.body ? " — " + String(n.body).slice(0, 50) : ""}`);
+    playSound("ans");
+  });
+}
+
+function stopAdminRealtime() {
+  _rtUnsubs.forEach((u) => {
+    try {
+      u();
+    } catch {}
+  });
+  _rtUnsubs = [];
+  adminReads = {};
+  complaintsData = {};
+  adminNotifs = [];
+  essayQueue = {};
+  _sinceWriting = false;
+  _notifSeen.clear();
+  _notifFirst = true;
+  _forumFirstSnapshot = true;
+  clearAdminBadges();
+}
+
+function startAdminRealtime() {
+  stopAdminRealtime();
+  const me = window._currentAdmin;
+  if (!me) return;
+  const uid = me.id;
+  _rtSinceFallback = Date.now();
+  // 1) حالة القراءة الخاصة بهذا الأدمن فقط
+  _rtUnsubs.push(
+    onValue(ref(db, `adminReads/${uid}`), (snap) => {
+      adminReads = snap.val() || {};
+      if (!adminReads.since && !_sinceWriting) {
+        _sinceWriting = true;
+        set(ref(db, `adminReads/${uid}/since`), serverTimestamp()).catch(() => (_sinceWriting = false));
+      }
+      refreshAdminBadges();
+      renderNotifPanel();
+      renderComplaintsIfVisible();
+      renderForum();
+    }),
+  );
+  // 2) الإشعارات (مشتركة) — الحالة مقروء/غير مقروء بتتحسب من adminReads
+  _rtUnsubs.push(
+    onValue(query(ref(db, "adminNotifications"), limitToLast(100)), (snap) => {
+      adminNotifs = Object.entries(snap.val() || {})
+        .map(([id, n]) => ({ id, ...n }))
+        .filter((n) => n && n.type)
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      handleNewNotifs();
+      refreshAdminBadges();
+      renderNotifPanel();
+    }),
+  );
+  // 3) الشكاوى
+  _rtUnsubs.push(
+    onValue(ref(db, "complaints"), (snap) => {
+      complaintsData = snap.val() || {};
+      refreshAdminBadges();
+      renderNotifPanel();
+      renderComplaintsIfVisible();
+    }),
+  );
+  // 4) طابور التصحيح المقالي (خفيف)
+  _rtUnsubs.push(
+    onValue(ref(db, "essayQueue"), (snap) => {
+      essayQueue = snap.val() || {};
+      refreshAdminBadges();
+      renderEssayQueueIfVisible();
+    }),
+  );
+  markForumDelivered();
+  ensureEssayQueueBackfill();
+}
+
+// ======================================================================
+//  Complaints (per-admin read state)
+// ======================================================================
+let _openComplaints = new Set();
+let _complaintFilter = "all";
+
+async function markComplaintReadForMe(key) {
+  const me = window._currentAdmin;
+  if (!me || !complaintsData[key]) return;
+  if (complaintIsRead(key, complaintsData[key])) return;
+  const upd = { [`adminReads/${me.id}/complaints/${key}`]: serverTimestamp() };
+  adminNotifs
+    .filter((n) => n.type === "complaint" && n.refId === key)
+    .forEach((n) => (upd[`adminReads/${me.id}/notifications/${n.id}`] = serverTimestamp()));
+  try {
+    await update(ref(db), upd);
+  } catch (e) {
+    console.warn("mark complaint read failed", e);
+  }
+}
+
+window.toggleComplaint = (key) => {
+  if (_openComplaints.has(key)) _openComplaints.delete(key);
+  else {
+    _openComplaints.add(key);
+    markComplaintReadForMe(key); // الفتح = قراءة (لهذا الأدمن فقط)
+  }
+  renderComplaints();
+};
+
+window.markComplaintRead = async (key) => {
+  await markComplaintReadForMe(key);
+};
+
+window.markAllComplaintsRead = async () => {
+  const me = window._currentAdmin;
+  if (!me) return;
+  const keys = unreadComplaintKeys();
+  if (!keys.length) return;
+  const upd = {};
+  keys.forEach((k) => (upd[`adminReads/${me.id}/complaints/${k}`] = serverTimestamp()));
+  adminNotifs
+    .filter((n) => n.type === "complaint" && keys.includes(n.refId))
+    .forEach((n) => (upd[`adminReads/${me.id}/notifications/${n.id}`] = serverTimestamp()));
+  await update(ref(db), upd).catch((e) => console.warn(e));
+};
+
+window.setComplaintFilter = (f) => {
+  _complaintFilter = f;
+  renderComplaints();
+};
+
+function renderComplaintsIfVisible() {
+  const t = document.getElementById("tab-complaints");
+  if (t && t.classList.contains("on") && window._currentAdmin) renderComplaints();
+}
+
+function renderComplaints() {
+  const c = document.getElementById("complaintsContainer");
+  if (!c || !window._currentAdmin) return;
+  const all = Object.entries(complaintsData || {})
+    .filter(([, r]) => r && typeof r === "object")
+    .sort((a, b) => (b[1].timestamp || 0) - (a[1].timestamp || 0));
+  if (!all.length) {
+    c.innerHTML = '<p class="cmp-empty">لا توجد شكاوى حتى الآن</p>';
+    return;
+  }
+  const unreadN = all.filter(([k, r]) => !complaintIsRead(k, r)).length;
+  const list = _complaintFilter === "unread" ? all.filter(([k, r]) => !complaintIsRead(k, r)) : all;
+  const bar = `<div class="cmp-filter" role="tablist">
+      <button type="button" class="${_complaintFilter === "all" ? "on" : ""}" onclick="setComplaintFilter('all')">الكل (${all.length})</button>
+      <button type="button" class="${_complaintFilter === "unread" ? "on" : ""}" onclick="setComplaintFilter('unread')">غير المقروءة <span class="cmp-count">${unreadN}</span></button>
+    </div>`;
+  if (!list.length) {
+    c.innerHTML = bar + '<p class="cmp-empty">كل الشكاوى مقروءة عندك ✅</p>';
+    return;
+  }
+  c.innerHTML =
+    bar +
+    list
+      .map(([key, r]) => {
+        const unread = !complaintIsRead(key, r);
+        const open = _openComplaints.has(key);
+        const text = String(r.text || "");
+        const prev = text.length > 90 ? text.slice(0, 90) + "…" : text;
+        return `<article class="cmp-card ${unread ? "unread" : ""} ${open ? "open" : ""}" id="cmp_${esc(key)}">
+          <header class="cmp-head" onclick="toggleComplaint('${esc(key)}')" role="button" tabindex="0">
+            <span class="cmp-dot" ${unread ? "" : "hidden"} title="غير مقروءة"></span>
+            <div class="cmp-main">
+              <div class="cmp-name">👤 ${esc(r.name || "زائر")}</div>
+              <div class="cmp-preview">${open ? "" : esc(prev)}</div>
+            </div>
+            <div class="cmp-side"><span class="cmp-time">${esc(r.time || "")}</span><span class="cmp-chev">${open ? "▲" : "▼"}</span></div>
+          </header>
+          ${
+            open
+              ? `<div class="cmp-body">
+            <div class="cmp-text">${esc(text)}</div>
+            <div class="cmp-phone">📱 <span id="phone_${esc(key)}" class="mono">••••••</span>
+              <button type="button" class="cmp-mini" data-phone="${esc(r.phone || "")}" onclick="toggleAdminPhone('${esc(key)}', this.dataset.phone, this)">إظهار</button>
+            </div>
+            <div class="cmp-actions">
+              <button class="abtn bg-red" onclick="deleteComplaint('${esc(key)}')" style="padding:6px 12px;font-size:12px">🗑️ حذف</button>
+            </div>
+          </div>`
+              : ""
+          }
+        </article>`;
+      })
+      .join("");
+}
+
+window.loadAdminComplaints = async () => {
+  renderComplaints();
+};
+
+window.toggleAdminPhone = (key, phone, btn) => {
+  const el = document.getElementById("phone_" + key);
+  if (!el) return;
+  if (el.innerText.includes("•")) {
+    el.innerText = phone || "غير متاح";
+    btn.innerText = "إخفاء";
+  } else {
+    el.innerText = "••••••";
+    btn.innerText = "إظهار";
+  }
+};
+
+window.deleteComplaint = async (key) => {
+  if (!confirm("حذف الشكوى؟")) return;
+  const upd = { [`complaints/${key}`]: null };
+  adminNotifs
+    .filter((n) => n.type === "complaint" && n.refId === key)
+    .forEach((n) => (upd[`adminNotifications/${n.id}`] = null));
+  try {
+    await update(ref(db), upd);
+    _openComplaints.delete(key);
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حذف الشكوى.");
+  }
+};
+
+window.clearAllComplaints = async () => {
+  if (!confirm("⚠️ حذف كل الشكاوى نهائياً؟")) return;
+  const upd = { complaints: null };
+  adminNotifs.filter((n) => n.type === "complaint").forEach((n) => (upd[`adminNotifications/${n.id}`] = null));
+  try {
+    await update(ref(db), upd);
+    _openComplaints.clear();
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حذف الشكاوى.");
+  }
+};
+
+// ======================================================================
+//  Essay grading workflow: Pending → Under Review → Corrected → Reviewed
+// ======================================================================
+const ESSAY_LOCK_MS = 30 * 60 * 1000; // القفل المؤقت بيفك لوحده بعد 30 دقيقة
+const ESSAY_STATUS = {
+  pending: { ar: "بانتظار التصحيح", en: "Pending", cls: "pending", icon: "⏳" },
+  under_review: { ar: "قيد المراجعة", en: "Under Review", cls: "review", icon: "🔍" },
+  corrected: { ar: "تم التصحيح", en: "Corrected", cls: "corrected", icon: "✅" },
+  reviewed: { ar: "تمت المراجعة", en: "Reviewed", cls: "reviewed", icon: "🛡️" },
+};
+const Q_MAP = {
+  essayStatus: "status",
+  essayLockedBy: "lockedBy",
+  essayLockedById: "lockedById",
+  essayLockedAt: "lockedAt",
+  essayGradedBy: "gradedBy",
+  essayGradedById: "gradedById",
+  essayGradedAtTs: "gradedAtTs",
+  essayReviewedBy: "reviewedBy",
+  essayReviewedById: "reviewedById",
+  essayReviewedAtTs: "reviewedAtTs",
+  pendingEssayCount: "pending",
+};
+
+const essayIndexes = (r) =>
+  (r?.questionsSnapshot || []).map((q, i) => (q.type === "essay" ? i : -1)).filter((i) => i >= 0);
+const essayGradedCount = (r) =>
+  essayIndexes(r).filter((i) => r.essayScores && r.essayScores[i] !== undefined && r.essayScores[i] !== null).length;
+
+function essayStatusOf(r) {
+  if (!hasEssayQuestions(r)) return null;
+  if (r.essayGraded === true) return r.essayStatus === "reviewed" ? "reviewed" : "corrected";
+  if (r.essayStatus === "under_review" && Date.now() - (Number(r.essayLockedAt) || 0) < ESSAY_LOCK_MS)
+    return "under_review";
+  return "pending";
+}
+
+function fmtTs(ts, fallback = "") {
+  const n = Number(ts);
+  return n ? new Date(n).toLocaleString("ar-EG", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : fallback;
+}
+
+function essayBadgeHtml(status) {
+  const s = ESSAY_STATUS[status];
+  if (!s) return "—";
+  return `<span class="es-badge ${s.cls}" title="${s.en}">${s.icon} ${s.ar}<small>${s.en}</small></span>`;
+}
+
+// سطر "مين/إمتى" حسب الحالة
+function essayMetaHtml(r) {
+  const st = essayStatusOf(r);
+  const parts = [];
+  if (st === "under_review") parts.push(`🔍 بواسطة ${esc(r.essayLockedBy || "أدمن")} · ${esc(timeAgo(r.essayLockedAt))}`);
+  if (st === "pending") {
+    const total = essayIndexes(r).length;
+    const done = essayGradedCount(r);
+    if (done) parts.push(`✏️ مسودة ${done}/${total}`);
+  }
+  if (st === "corrected" || st === "reviewed") {
+    parts.push(
+      r.essayGradedBy
+        ? `✅ صحّحه ${esc(r.essayGradedBy)} · ${esc(fmtTs(r.essayGradedAtTs, r.gradedAt || ""))}`
+        : `✅ مصحَّح${r.gradedAt ? " · " + esc(r.gradedAt) : ""}`,
+    );
+  }
+  if (st === "reviewed")
+    parts.push(`🛡️ راجعه ${esc(r.essayReviewedBy || "أدمن")} · ${esc(fmtTs(r.essayReviewedAtTs, r.essayReviewedAt || ""))}`);
+  return parts.length ? `<div class="es-meta">${parts.join("<br>")}</div>` : "";
+}
+
+const compact = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
+
+function queueBase(examId, code, r) {
+  return compact({
+    examId,
+    examName: r.examName || "",
+    code,
+    name: r.name || "",
+    time: r.time || "",
+    submittedAt: r.submittedAt || 0,
+    total: essayIndexes(r).length,
+  });
+}
+
+function queueEntryFromResult(examId, code, r) {
+  const st = essayStatusOf(r);
+  return compact({
+    ...queueBase(examId, code, r),
+    status: st,
+    pending: r.essayGraded === true ? 0 : Math.max(0, essayIndexes(r).length - essayGradedCount(r)),
+    gradedBy: r.essayGradedBy,
+    gradedById: r.essayGradedById,
+    gradedAtTs: r.essayGradedAtTs,
+    reviewedBy: r.essayReviewedBy,
+    reviewedById: r.essayReviewedById,
+    reviewedAtTs: r.essayReviewedAtTs,
+    lockedBy: r.essayLockedBy,
+    lockedById: r.essayLockedById,
+    lockedAt: r.essayLockedAt,
+  });
+}
+
+// تحديث ذرّي (نتيجة الامتحان + نتيجة الطالب + فهرس الطابور) في عملية واحدة
+function patchEssay(examId, code, patch, result) {
+  const upd = {};
+  Object.entries(patch).forEach(([k, v]) => {
+    upd[`examResults/${examId}/${code}/${k}`] = v;
+    upd[`results/${code}/${k}`] = v;
+  });
+  const qk = `essayQueue/${examId}__${code}`;
+  Object.entries(queueBase(examId, code, result || {})).forEach(([k, v]) => (upd[`${qk}/${k}`] = v));
+  Object.entries(patch).forEach(([k, v]) => {
+    if (Q_MAP[k]) upd[`${qk}/${Q_MAP[k]}`] = v;
+  });
+  return update(ref(db), upd);
+}
+
+async function ensureEssayQueueBackfill() {
+  try {
+    if ((await get(ref(db, "essayQueueMeta/backfilledAt"))).val()) return;
+    const all = (await get(ref(db, "examResults"))).val() || {};
+    const existing = (await get(ref(db, "essayQueue"))).val() || {};
+    const upd = {};
+    Object.entries(all).forEach(([examId, byCode]) =>
+      Object.entries(byCode || {}).forEach(([code, r]) => {
+        if (!r || !hasEssayQuestions(r)) return;
+        const key = `${examId}__${code}`;
+        if (!existing[key]) upd[`essayQueue/${key}`] = queueEntryFromResult(examId, code, r);
+      }),
+    );
+    upd["essayQueueMeta/backfilledAt"] = serverTimestamp();
+    await update(ref(db), upd);
+  } catch (e) {
+    console.warn("essay queue backfill failed", e);
+  }
+}
+
+function purgeEssayQueue(examId) {
+  const upd = {};
+  Object.keys(essayQueue || {})
+    .filter((k) => k.startsWith(examId + "__"))
+    .forEach((k) => (upd[`essayQueue/${k}`] = null));
+  if (Object.keys(upd).length) update(ref(db), upd).catch(() => {});
+}
+
+// الأدمن ينتبه لـ: Pending + Under Review + (Corrected لسه محتاج اعتماد)
+function queueStatus(e) {
+  if (e.status === "under_review" && Date.now() - (Number(e.lockedAt) || 0) >= ESSAY_LOCK_MS) return "pending";
+  return e.status || "pending";
+}
+const essayAttentionCount = () =>
+  Object.values(essayQueue || {}).filter((e) => ["pending", "under_review"].includes(queueStatus(e))).length;
+
+// ---------- grading modal ----------
+window.gradeEssays = async (examId, code) => {
+  const me = window._currentAdmin;
+  if (!me) return;
+  const snap = await get(ref(db, `examResults/${examId}/${code}`));
+  if (!snap.exists()) {
+    update(ref(db), { [`essayQueue/${examId}__${code}`]: null }).catch(() => {});
+    return alert("النتيجة غير موجودة");
+  }
+  const result = snap.val();
+  const essays = (result.questionsSnapshot || [])
+    .map((question, index) => ({ question, index }))
+    .filter(({ question }) => question.type === "essay");
+  if (!essays.length) return alert("لا توجد أسئلة مقالية في هذه النتيجة");
+  const status = essayStatusOf(result);
+  if (status === "under_review" && result.essayLockedById !== me.id) {
+    if (!confirm(`${result.essayLockedBy || "أدمن آخر"} بيراجع الإجابة دي دلوقتي.\nتفتحها برضه؟`)) return;
+  }
+  let lockedByMe = false;
+  if (!result.essayGraded) {
+    try {
+      const lock = {
+        essayStatus: "under_review",
+        essayLockedBy: me.name,
+        essayLockedById: me.id,
+        essayLockedAt: Date.now(),
+      };
+      await patchEssay(examId, code, lock, result);
+      Object.assign(result, lock);
+      lockedByMe = true;
+    } catch (e) {
+      console.warn("lock failed", e);
+    }
+  }
+  gradingTarget = { examId, code, result, lockedByMe };
+  document.getElementById("essayGradeTitle").innerText =
+    `تصحيح إجابات ${result.name || "الطالب"} — ${result.examName || ""}`;
+  renderEssayModalStatus();
+  document.getElementById("essayGradeList").innerHTML = essays
+    .map(({ question, index }, number) => {
+      const has = result.essayScores && result.essayScores[index] !== undefined && result.essayScores[index] !== null;
+      return `
+        <section class="essay-grade-item" data-qi="${index}">
+          <h4>السؤال ${number + 1} — الدرجة القصوى ${fmtNum(questionPoints(question))}
+            <span class="eq-state ${has ? "done" : "todo"}" id="eqState_${index}">${has ? "✅ مُصحَّح" : "⏳ لم يُصحَّح"}</span></h4>
+          <p class="essay-grade-question">${esc(question.q)}</p>
+          <div class="essay-grade-answer">${esc(result.userAnswers?.[index] || "لم يكتب الطالب إجابة")}</div>
+          <label for="essayScore_${index}">الدرجة المستحقة</label>
+          <input class="essay-score-input" id="essayScore_${index}" data-index="${index}"
+            type="number" min="0" max="${questionPoints(question)}" step="0.5" placeholder="—"
+            value="${has ? Number(result.essayScores[index]) : ""}"
+            oninput="document.getElementById('eqState_${index}').className='eq-state dirty';document.getElementById('eqState_${index}').innerText='✏️ تعديل غير محفوظ'" />
+        </section>`;
+    })
+    .join("");
+  const revBtn = document.getElementById("essayReviewBtn");
+  if (revBtn) revBtn.hidden = !(result.essayGraded === true && status !== "reviewed");
+  const draftBtn = document.getElementById("essayDraftBtn");
+  if (draftBtn) draftBtn.hidden = result.essayGraded === true;
+  document.getElementById("essayGradeModal").style.display = "flex";
+};
+
+function renderEssayModalStatus() {
+  const el = document.getElementById("essayStatusLine");
+  if (!el || !gradingTarget) return;
+  const r = gradingTarget.result;
+  el.innerHTML = `${essayBadgeHtml(essayStatusOf(r))}${essayMetaHtml(r)}`;
+}
+
+function readEssayInputs(result) {
+  const out = {};
+  let missing = 0;
+  for (const input of document.querySelectorAll("#essayGradeList .essay-score-input")) {
+    const index = Number(input.dataset.index);
+    const question = result.questionsSnapshot[index];
+    if (input.value.trim() === "") {
+      missing++;
+      continue;
+    }
+    const points = Number(input.value);
+    if (!Number.isFinite(points) || points < 0 || points > questionPoints(question)) {
+      return { error: `الدرجة لازم تكون من 0 إلى ${questionPoints(question)}` };
+    }
+    out[index] = points;
+  }
+  return { scores: out, missing };
+}
+
+window.saveEssayDraft = async () => {
+  const me = window._currentAdmin;
+  if (!gradingTarget || !me) return;
+  const { examId, code, result } = gradingTarget;
+  const r = readEssayInputs(result);
+  if (r.error) return alert(r.error);
+  const essayScores = { ...(result.essayScores || {}), ...r.scores };
+  const total = essayIndexes(result).length;
+  const done = Object.keys(essayScores).filter((i) => essayIndexes(result).includes(Number(i))).length;
+  try {
+    await patchEssay(examId, code, { essayScores, pendingEssayCount: Math.max(0, total - done) }, result);
+    result.essayScores = essayScores;
+    showToast("✅ تم حفظ المسودة");
+    // حدّث علامات كل سؤال
+    Object.keys(r.scores).forEach((i) => {
+      const s = document.getElementById("eqState_" + i);
+      if (s) {
+        s.className = "eq-state done";
+        s.innerText = "✅ مُصحَّح";
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    alert("تعذر حفظ المسودة. تحقق من الاتصال.");
+  }
+};
+
+window.saveEssayGrades = async () => {
+  const me = window._currentAdmin;
+  if (!gradingTarget || !me) return;
+  const { examId, code, result } = gradingTarget;
+  const r = readEssayInputs(result);
+  if (r.error) return alert(r.error);
+  if (r.missing) {
+    return alert(`لسه ${r.missing} سؤال مقالي من غير درجة.\nكمّل تصحيحهم أو اضغط "حفظ مسودة".`);
+  }
+  const essayScores = { ...(result.essayScores || {}), ...r.scores };
+  let score = 0;
+  let total = 0;
+  (result.questionsSnapshot || []).forEach((question, index) => {
+    const points = questionPoints(question);
+    total += points;
+    if (question.type === "essay") score += Number(essayScores[index]) || 0;
+    else if (result.userAnswers?.[index] === question.c) score += points;
+  });
+  const passMark = result.passMark || 50;
+  const pct = total ? Math.round((score / total) * 100) : 0;
+  const patch = {
+    score,
+    total,
+    essayScores,
+    essayGraded: true,
+    essayPending: false,
+    pendingEssayCount: 0,
+    passed: pct >= passMark,
+    gradedAt: new Date().toLocaleString("ar-EG"),
+    essayStatus: "corrected",
+    essayGradedBy: me.name,
+    essayGradedById: me.id,
+    essayGradedAtTs: Date.now(),
+    essayLockedBy: null,
+    essayLockedById: null,
+    essayLockedAt: null,
+    // أي تعديل على الدرجات بعد المراجعة يحتاج مراجعة جديدة
+    essayReviewedBy: null,
+    essayReviewedById: null,
+    essayReviewedAtTs: null,
+    essayReviewedAt: null,
+  };
+  try {
+    await patchEssay(examId, code, patch, result);
+  } catch (e) {
+    console.error(e);
+    return alert("تعذر حفظ التصحيح. تحقق من الاتصال وحاول تاني.");
+  }
+  closeModal("essayGradeModal");
+  gradingTarget = null;
+  logAction(`تصحيح مقالي: ${result.name} (${fmtNum(score)}/${fmtNum(total)})`);
+  if (getCurEx()?.id === examId) await loadExamResultsTab();
+  alert("تم حفظ التصحيح، وأصبحت النتيجة متاحة للطالب.");
+};
+
+window.markEssayReviewed = async (examId, code) => {
+  const me = window._currentAdmin;
+  if (!me) return;
+  if (!examId && gradingTarget) ({ examId, code } = gradingTarget);
+  const snap = await get(ref(db, `examResults/${examId}/${code}`));
+  if (!snap.exists()) return alert("النتيجة غير موجودة");
+  const result = snap.val();
+  if (result.essayGraded !== true) return alert("لازم التصحيح يخلص الأول قبل اعتماد المراجعة.");
+  try {
+    await patchEssay(
+      examId,
+      code,
+      {
+        essayStatus: "reviewed",
+        essayReviewedBy: me.name,
+        essayReviewedById: me.id,
+        essayReviewedAtTs: Date.now(),
+        essayReviewedAt: new Date().toLocaleString("ar-EG"),
+      },
+      result,
+    );
+  } catch (e) {
+    console.error(e);
+    return alert("تعذر اعتماد المراجعة.");
+  }
+  logAction(`اعتماد مراجعة مقالي: ${result.name}`);
+  showToast("🛡️ تم اعتماد المراجعة");
+  if (gradingTarget && gradingTarget.code === code) {
+    closeModal("essayGradeModal");
+    gradingTarget = null;
+  }
+  if (getCurEx()?.id === examId) loadExamResultsTab();
+};
+
+window.cancelEssayGrading = async () => {
+  const t = gradingTarget;
+  gradingTarget = null;
+  closeModal("essayGradeModal");
+  if (t && t.lockedByMe && !t.result.essayGraded) {
+    try {
+      await patchEssay(
+        t.examId,
+        t.code,
+        { essayStatus: "pending", essayLockedBy: null, essayLockedById: null, essayLockedAt: null },
+        t.result,
+      );
+    } catch (e) {
+      console.warn("unlock failed", e);
+    }
+  }
+};
+
+// ---------- exam results tab (with status filters) ----------
+let _resultsFilter = "all";
+window.setResultsFilter = (f) => {
+  _resultsFilter = f;
+  loadExamResultsTab();
+};
+
+window.loadExamResultsTab = async () => {
+  const ex = getCurEx();
+  if (!ex) return;
+  const list = (await getExamResults(ex.id)).sort((a, b) => {
+    const pa = isResultGradingComplete(a) ? 1 : 0;
+    const pb = isResultGradingComplete(b) ? 1 : 0;
+    return pa - pb || b.score - a.score; // اللي محتاج تصحيح الأول
+  });
+  const c = document.getElementById("examResultsArea");
+  if (!list.length) {
+    c.innerHTML = '<p style="color:var(--TS);text-align:center;padding:20px">لا توجد نتائج بعد</p>';
+    return;
+  }
+  const counts = { pending: 0, under_review: 0, corrected: 0, reviewed: 0 };
+  list.forEach((s) => {
+    const st = essayStatusOf(s);
+    if (st) counts[st]++;
+  });
+  const hasEssay = Object.values(counts).some((n) => n > 0);
+  let bar = "";
+  if (hasEssay) {
+    const chip = (key, label, n) =>
+      `<button type="button" class="es-chip ${_resultsFilter === key ? "on" : ""} ${key}" onclick="setResultsFilter('${key}')">${label} <b>${n}</b></button>`;
+    bar =
+      '<div class="es-filter">' +
+      chip("all", "الكل", list.length) +
+      chip("pending", "Pending · بانتظار التصحيح", counts.pending) +
+      chip("under_review", "Under Review · قيد المراجعة", counts.under_review) +
+      chip("corrected", "Corrected · تم التصحيح", counts.corrected) +
+      chip("reviewed", "Reviewed · تمت المراجعة", counts.reviewed) +
+      "</div>";
+  }
+  const shown = list.filter((s) => _resultsFilter === "all" || essayStatusOf(s) === _resultsFilter);
+  let h = `${bar}<table><thead><tr><th>م</th><th>الاسم</th><th>الكود</th><th>الدرجة</th><th>النسبة</th><th>الوقت</th>${hasEssay ? "<th>حالة التصحيح</th>" : ""}<th>إدارة</th></tr></thead><tbody>`;
+  shown.forEach((s, i) => {
+    const st = essayStatusOf(s);
+    const pending = hasEssayQuestions(s) && !isResultGradingComplete(s);
+    const pct = s.total ? Math.round((s.score / s.total) * 100) : 0;
+    const gradeBtn = hasEssayQuestions(s)
+      ? `<button class="abtn bg-orange" onclick="gradeEssays('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 9px;font-size:11px;margin-bottom:10px;">${pending ? "✍️ تصحيح المقالي" : "مراجعة التصحيح"}</button> `
+      : "";
+    const reviewBtn =
+      st === "corrected"
+        ? `<button class="abtn bg-purple" onclick="markEssayReviewed('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 9px;font-size:11px;margin-bottom:10px;">🛡️ اعتماد</button> `
+        : "";
+    h += `<tr><td>${i + 1}</td><td>${esc(s.name)}</td><td style="font-family:monospace">${esc(s.code)}</td><td>${pending ? '<span class="essay-badge">بانتظار تصحيح المقالي</span>' : `${fmtNum(s.score)}/${fmtNum(s.total)}`}</td><td>${pending ? "—" : pct + "%"}</td><td style="font-size:11px; margin-bottom:5px;">${esc(s.time)}</td>${hasEssay ? `<td>${st ? essayBadgeHtml(st) + essayMetaHtml(s) : "—"}</td>` : ""}<td>${gradeBtn}${reviewBtn}<button class="abtn bg-red" onclick="delExamResult('${esc(ex.id)}','${esc(s.code)}')" style="padding:5px 15px;width:70%;font-size:11px">حذف</button></td></tr>`;
+  });
+  if (!shown.length) h += `<tr><td colspan="${hasEssay ? 8 : 7}" style="padding:18px;color:var(--TS)">لا توجد نتائج بهذه الحالة</td></tr>`;
+  c.innerHTML = h + "</tbody></table>";
+};
+
+// ---------- essay queue tab (كل الامتحانات) ----------
+let _eqFilter = "attention";
+let _eqSearch = "";
+window.setEssayQueueFilter = (f) => {
+  _eqFilter = f;
+  renderEssayQueue();
+};
+window.setEssayQueueSearch = (v) => {
+  _eqSearch = String(v || "").trim().toLowerCase();
+  renderEssayQueue();
+};
+window.onEssayTabOpened = () => renderEssayQueue();
+
+function renderEssayQueueIfVisible() {
+  const t = document.getElementById("tab-essays");
+  if (t && t.classList.contains("on") && window._currentAdmin) renderEssayQueue();
+}
+
+function renderEssayQueue() {
+  const box = document.getElementById("essayQueueContainer");
+  if (!box || !window._currentAdmin) return;
+  const entries = Object.entries(essayQueue || {})
+    .filter(([, e]) => e && e.code)
+    .map(([key, e]) => ({ key, ...e, st: queueStatus(e) }));
+  const counts = { pending: 0, under_review: 0, corrected: 0, reviewed: 0 };
+  entries.forEach((e) => counts[e.st] !== undefined && counts[e.st]++);
+  const attention = counts.pending + counts.under_review;
+  const chip = (key, label, n) =>
+    `<button type="button" class="es-chip ${_eqFilter === key ? "on" : ""} ${key}" onclick="setEssayQueueFilter('${key}')">${label} <b>${n}</b></button>`;
+  let html = `<div class="es-summary">
+      <div class="es-kpi warn"><b>${attention}</b><span>تحتاج تصحيح الآن</span></div>
+      <div class="es-kpi"><b>${counts.corrected}</b><span>مصحَّحة وتنتظر الاعتماد</span></div>
+      <div class="es-kpi ok"><b>${counts.reviewed}</b><span>تمت مراجعتها</span></div>
+    </div>
+    <div class="es-filter">
+      ${chip("attention", "تحتاج إجراء", attention)}
+      ${chip("pending", "Pending", counts.pending)}
+      ${chip("under_review", "Under Review", counts.under_review)}
+      ${chip("corrected", "Corrected", counts.corrected)}
+      ${chip("reviewed", "Reviewed", counts.reviewed)}
+      ${chip("all", "الكل", entries.length)}
+    </div>
+    <input type="search" class="es-search" placeholder="🔎 بحث باسم الطالب أو الامتحان أو الكود" value="${esc(_eqSearch)}" oninput="setEssayQueueSearch(this.value)">`;
+  let shown = entries.filter((e) => {
+    if (_eqFilter === "attention") return ["pending", "under_review"].includes(e.st);
+    if (_eqFilter === "all") return true;
+    return e.st === _eqFilter;
+  });
+  if (_eqSearch) {
+    shown = shown.filter((e) => `${e.name} ${e.examName} ${e.code}`.toLowerCase().includes(_eqSearch));
+  }
+  shown.sort((a, b) => {
+    const order = { pending: 0, under_review: 1, corrected: 2, reviewed: 3 };
+    return order[a.st] - order[b.st] || (b.submittedAt || 0) - (a.submittedAt || 0);
+  });
+  if (!shown.length) {
+    html += `<p class="cmp-empty">${_eqFilter === "attention" && !_eqSearch ? "ممتاز! مفيش إجابات مقالية محتاجة تصحيح 🎉" : "لا توجد نتائج مطابقة"}</p>`;
+  } else {
+    html += '<div class="es-list">' + shown.map((e) => {
+      const meta = [];
+      if (e.st === "under_review") meta.push(`🔍 بواسطة ${esc(e.lockedBy || "أدمن")} · ${esc(timeAgo(e.lockedAt))}`);
+      if (e.st === "pending" && e.total && e.pending !== undefined && e.pending < e.total)
+        meta.push(`✏️ مسودة ${e.total - e.pending}/${e.total}`);
+      if (e.st === "corrected" || e.st === "reviewed")
+        meta.push(`✅ صحّحه ${esc(e.gradedBy || "—")}${e.gradedAtTs ? " · " + esc(fmtTs(e.gradedAtTs)) : ""}`);
+      if (e.st === "reviewed")
+        meta.push(`🛡️ راجعه ${esc(e.reviewedBy || "—")}${e.reviewedAtTs ? " · " + esc(fmtTs(e.reviewedAtTs)) : ""}`);
+      const when = e.submittedAt ? fmtTs(e.submittedAt) : e.time || "";
+      const act =
+        e.st === "pending" || e.st === "under_review"
+          ? `<button class="abtn bg-orange" onclick="gradeEssays('${esc(e.examId)}','${esc(e.code)}')">✍️ تصحيح</button>`
+          : e.st === "corrected"
+            ? `<button class="abtn bg-purple" onclick="markEssayReviewed('${esc(e.examId)}','${esc(e.code)}')">🛡️ اعتماد</button><button class="abtn bg-blue" onclick="gradeEssays('${esc(e.examId)}','${esc(e.code)}')">👁️ فتح</button>`
+            : `<button class="abtn bg-blue" onclick="gradeEssays('${esc(e.examId)}','${esc(e.code)}')">👁️ فتح</button>`;
+      return `<div class="es-row ${e.st}">
+          <div class="es-row-main">
+            <div class="es-row-top"><b>${esc(e.name || "—")}</b>${essayBadgeHtml(e.st)}</div>
+            <div class="es-row-sub">📝 ${esc(e.examName || "—")} · 🔑 <span class="mono">${esc(e.code)}</span> · 🕒 ${esc(when)}</div>
+            ${meta.length ? `<div class="es-meta">${meta.join(" &nbsp;|&nbsp; ")}</div>` : ""}
+          </div>
+          <div class="es-row-act">${act}</div>
+        </div>`;
+    }).join("") + "</div>";
+  }
+  const sel = box.querySelector(".es-search");
+  const hadFocus = sel && document.activeElement === sel;
+  const pos = hadFocus ? sel.selectionStart : 0;
+  box.innerHTML = html;
+  if (hadFocus) {
+    const n = box.querySelector(".es-search");
+    n.focus();
+    try {
+      n.setSelectionRange(pos, pos);
+    } catch {}
+  }
+}
+
+// ======================================================================
+//  Announce new exam to students (public event feed)
+// ======================================================================
+const _announceTimers = new Map();
+const examAnnounceable = (ex) =>
+  !!ex && !ex.closed && !ex.archived && (ex.questions || []).length > 0;
+
+async function announceExam(examId, { force = false } = {}) {
+  const ex = exams.find((e) => e.id === examId);
+  if (!examAnnounceable(ex)) return false;
+  if (ex.announcedAt && !force) return false;
+  const ev = push(ref(db, "publicEvents"));
+  await update(ref(db), {
+    [`publicEvents/${ev.key}`]: {
+      type: "exam",
+      examId: ex.id,
+      title: "تم نشر امتحان جديد",
+      body: String(ex.name || "").slice(0, 120),
+      ts: serverTimestamp(),
+    },
+    [`exams/${ex.id}/announcedAt`]: serverTimestamp(),
+  });
+  return true;
+}
+
+// تأجيل الإرسال شوية عشان لو الأدمن لسه بيضيف أسئلة ما يتبعتش إشعار لامتحان ناقص
+function scheduleExamAnnounce(examId, delay = 45000) {
+  clearTimeout(_announceTimers.get(examId));
+  _announceTimers.set(
+    examId,
+    setTimeout(() => {
+      _announceTimers.delete(examId);
+      announceExam(examId).catch((e) => console.warn("announce failed", e));
+    }, delay),
+  );
+}
+
+window.examNotifyStudents = async () => {
+  const ex = getCurEx();
+  if (!ex) return;
+  if (!examAnnounceable(ex)) return alert("الامتحان لازم يكون مفتوح وفيه أسئلة عشان نبعت إشعار للطلاب.");
+  if (!confirm(`إرسال إشعار للطلاب بامتحان "${ex.name}" الآن؟`)) return;
+  try {
+    await announceExam(ex.id, { force: true });
+    logAction("إشعار الطلاب بالامتحان: " + ex.name);
+    showToast("🔔 تم إرسال الإشعار للطلاب");
+  } catch (e) {
+    console.error(e);
+    alert("تعذر إرسال الإشعار.");
+  }
+};
+
+// ======================================================================
+//  Shared helpers for feature modules (certificates / notifications)
+// ======================================================================
+window.__exam = {
+  db,
+  esc,
+  showToast,
+  logAction,
+  requireOwner,
+  isOwner,
+  getCurEx,
+  getExamResults,
+  isResultGradingComplete,
+  hasEssayQuestions,
+  fmtNum,
+  getExams: () => exams,
+  getStudentName: () => studentName,
+  getAdmin: () => window._currentAdmin,
+};
+
+// ======================================================================
+//  Student profile (الاسم + الأكواد يفضلوا محفوظين) + بحث بالكود والامتحان
+//  + إظهار "أدمن" جنب الاسم وزر لوحة التحكم للأدمن فقط
+// ======================================================================
+const STUDENT_KEY = "studentProfile.v1";
+const normName = (v) =>
+  String(v || "")
+    .normalize("NFKC")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/ة/g, "ه")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+function readStudent() {
+  try {
+    const p = JSON.parse(localStorage.getItem(STUDENT_KEY) || "null");
+    return p && typeof p === "object"
+      ? { name: p.name || "", phone: p.phone || "", codes: Array.isArray(p.codes) ? p.codes : [] }
+      : { name: "", phone: "", codes: [] };
+  } catch {
+    return { name: "", phone: "", codes: [] };
+  }
+}
+function writeStudent(p) {
+  try {
+    localStorage.setItem(STUDENT_KEY, JSON.stringify(p));
+  } catch (e) {
+    console.warn("تعذر حفظ بيانات الطالب", e);
+  }
+}
+function saveStudentIdentity(name, phone) {
+  const p = readStudent();
+  p.name = name;
+  p.phone = phone;
+  writeStudent(p);
+}
+function rememberStudentCode(code, examId, examName, time) {
+  const p = readStudent();
+  p.codes = [{ code, examId, examName, time }, ...p.codes.filter((c) => !(c.code === code && c.examId === examId))].slice(0, 30);
+  writeStudent(p);
+  renderStudentCard();
+}
+
+// ---- أسماء الأدمنز (للمطابقة فقط) ----
+function adminNameList() {
+  const list = [{ id: "owner", name: ownerProfile.name || "مالك الموقع" }];
+  Object.entries(adminAccounts || {}).forEach(([id, a]) => {
+    if (a && a.active !== false) list.push({ id, name: a.name || "" });
+  });
+  return list;
+}
+function matchAdminByName(name) {
+  const n = normName(name);
+  if (!n) return null;
+  return adminNameList().find((a) => normName(a.name) === n) || null;
+}
+
+const ADMIN_BADGE = '<span class="admin-name-badge">👑 أدمن</span>';
+
+function refreshAdminEntry() {
+  const name = document.getElementById("nameInput")?.value || "";
+  const adm = matchAdminByName(name);
+  const btn = document.getElementById("adminOpenBtn");
+  const tag = document.getElementById("adminNameTag");
+  document.body.classList.toggle("name-is-admin", !!adm);
+  if (btn) btn.hidden = !adm;
+  if (tag) {
+    tag.hidden = !adm;
+    tag.innerHTML = adm ? `${ADMIN_BADGE} <span>تم التعرف على حساب الأدمن «${esc(adm.name)}»</span>` : "";
+  }
+  const w = document.getElementById("wStudentName");
+  if (w && studentName && document.getElementById("welcomeScreen")?.style.display === "block") {
+    const a2 = matchAdminByName(studentName);
+    w.innerHTML = "مرحباً، " + esc(studentName) + (a2 ? " " + ADMIN_BADGE : "");
+  }
+  renderStudentCard();
+}
+
+function renderStudentCard() {
+  const card = document.getElementById("studentCard");
+  if (!card) return;
+  const p = readStudent();
+  if (!p.name) {
+    card.hidden = true;
+    card.innerHTML = "";
+    return;
+  }
+  const adm = matchAdminByName(p.name);
+  const codes = p.codes
+    .map(
+      (c, i) => `<button type="button" class="sc-code" data-i="${i}" title="${esc(c.examName || "")}">
+        <span class="mono">${esc(c.code)}</span><small>${esc(c.examName || "امتحان")}</small></button>`,
+    )
+    .join("");
+  card.hidden = false;
+  card.innerHTML = `<div class="sc-head"><div><b>👤 ${esc(p.name)}</b> ${adm ? ADMIN_BADGE : ""}</div>
+      <button type="button" class="sc-logout" data-act="logout">🚪 تسجيل خروج</button></div>
+    ${codes ? `<div class="sc-label">🔑 أكوادك (اضغط على الكود لعرض النتيجة):</div><div class="sc-codes">${codes}</div>` : '<div class="sc-label">لسه ما سلّمتش أي امتحان من هذا الجهاز.</div>'}`;
+}
+
+function fillExamSelect() {
+  const sel = document.getElementById("codeExamSelect");
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML =
+    '<option value="">🔎 أي امتحان (تلقائي)</option>' +
+    exams
+      .filter((e) => !e.archived)
+      .map((e) => `<option value="${esc(e.id)}">${esc(e.emoji || "📝")} ${esc(e.name)}</option>`)
+      .join("");
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+}
+
+window.studentLogout = () => {
+  if (!confirm("تسجيل الخروج؟ هيتم مسح اسمك وأكوادك المحفوظة من هذا الجهاز.")) return;
+  try {
+    localStorage.removeItem(STUDENT_KEY);
+  } catch {}
+  studentName = "";
+  ["nameInput", "phoneInput", "codeInput"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  document.getElementById("welcomeScreen").style.display = "none";
+  refreshAdminEntry();
+};
+
+(function initStudentUI() {
+  const nameEl = document.getElementById("nameInput");
+  const phoneEl = document.getElementById("phoneInput");
+  if (!nameEl) return;
+  const p = readStudent();
+  if (p.name) nameEl.value = p.name;
+  if (p.phone && phoneEl) phoneEl.value = p.phone;
+  nameEl.addEventListener("input", refreshAdminEntry);
+  nameEl.addEventListener("change", () => {
+    const v = nameEl.value.trim();
+    if (v) saveStudentIdentity(v, phoneEl?.value.trim() || "");
+  });
+  const card = document.getElementById("studentCard");
+  card?.addEventListener("click", (e) => {
+    if (e.target.closest("[data-act='logout']")) return window.studentLogout();
+    const b = e.target.closest(".sc-code");
+    if (!b) return;
+    const c = readStudent().codes[Number(b.dataset.i)];
+    if (!c) return;
+    document.getElementById("codeInput").value = c.code;
+    const sel = document.getElementById("codeExamSelect");
+    if (sel && c.examId) sel.value = c.examId;
+    window.checkResult();
+  });
+  fillExamSelect();
+  refreshAdminEntry();
 })();

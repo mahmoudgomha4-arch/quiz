@@ -12,15 +12,16 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <link
-      href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&family=Tajawal:wght@400;500;700;800;900&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&family=Tajawal:wght@400;500;700;800;900&family=Amiri:wght@400;700&family=Reem+Kufi:wght@500;700&family=El+Messiri:wght@500;700&family=Aref+Ruqaa:wght@400;700&family=Almarai:wght@400;700;800&family=Lemonada:wght@500;700&family=Markazi+Text:wght@500;700&family=Lalezar&family=Cormorant+Garamond:ital,wght@0,600;1,500;1,600&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="css/features.css" />
   </head>
   <body id="body">
     <div id="notif" class="notif-bar"></div>
 
-    <button id="adminOpenBtn" class="admin-open" onclick="showAdminAuth()">
+    <button id="adminOpenBtn" class="admin-open" onclick="showAdminAuth()" hidden>
       ⚙️ لوحة التحكم
     </button>
 
@@ -98,6 +99,7 @@
           placeholder="كلمة سر الأدمن"
           onkeydown="if (event.key === 'Enter') checkAdminAuth();"
         />
+        <p class="session-note">🔒 بعد الدخول يتم حفظ الجلسة على هذا الجهاز بشكل آمن (بدون حفظ كلمة السر) حتى تضغط «تسجيل الخروج».</p>
         <div class="modal-acts">
           <button
             class="abtn bg-blue"
@@ -126,9 +128,26 @@
             <span id="adminHeaderTitle">⚙️ لوحة التحكم</span>
             <span id="adminRoleBadge" class="role-badge"></span>
           </div>
-          <button class="close-admin" onclick="closeAdminPanel()">
-            ✖ إغلاق
-          </button>
+          <div class="admin-header-actions">
+            <div class="notif-wrap">
+              <button id="notifBell" class="notif-bell" type="button" onclick="toggleNotifPanel()" aria-label="الإشعارات" title="الإشعارات">
+                🔔<span id="notifBellCount" class="notif-count" hidden>0</span>
+              </button>
+              <div id="notifPanel" class="notif-panel" hidden>
+                <div class="notif-panel-head">
+                  <b>🔔 الإشعارات</b>
+                  <button type="button" onclick="markAllNotificationsRead()">تعليم الكل كمقروء</button>
+                </div>
+                <div id="notifList" class="notif-list"></div>
+              </div>
+            </div>
+            <button class="logout-admin" type="button" onclick="adminLogout()" title="تسجيل الخروج">
+              🔴 تسجيل الخروج
+            </button>
+            <button class="close-admin" onclick="closeAdminPanel()">
+              ✖ إغلاق
+            </button>
+          </div>
         </div>
         <div class="big-warn">
           🚫 لوحة التحكم مخصصة للمشرف فقط - يُمنع العبث 🚫
@@ -152,8 +171,14 @@
             <button class="atab" onclick="switchTab('logs', this)">
               🕒 السجل
             </button>
-            <button class="atab" onclick="switchTab('complaints', this)">
-              📢 الشكاوى
+            <button class="atab" id="complaintsTabBtn" onclick="switchTab('complaints', this)">
+              📢 الشكاوى <span id="complaintsBadge" class="forum-badge" hidden>0</span>
+            </button>
+            <button class="atab" id="essaysTabBtn" onclick="switchTab('essays', this)">
+              ✍️ التصحيح المقالي <span id="essayQueueBadge" class="forum-badge" hidden>0</span>
+            </button>
+            <button class="atab" id="certsTabBtn" onclick="switchTab('certs', this)">
+              🎓 الشهادات
             </button>
             <button class="atab" id="forumTabBtn" onclick="switchTab('forum', this)">
               💬 منتدى الأدمن <span id="forumBadge" class="forum-badge" hidden>0</span>
@@ -317,13 +342,16 @@
                 <button class="abtn bg-blue" onclick="loadAdminComplaints()">
                   🔄 تحديث
                 </button>
+                <button class="abtn bg-green" onclick="markAllComplaintsRead()">
+                  ✅ تعليم الكل كمقروء (لي فقط)
+                </button>
                 <button class="abtn bg-red" onclick="clearAllComplaints()">
                   🗑️ حذف الكل
                 </button>
               </div>
               <div id="complaintsContainer">
                 <p style="color: var(--TS); text-align: center; padding: 20px">
-                  اضغط تحديث لعرض الشكاوى
+                  جاري تحميل الشكاوى...
                 </p>
               </div>
             </div>
@@ -344,6 +372,23 @@
               <div class="owner-only" style="margin-top:10px">
                 <button class="abtn bg-red" onclick="clearForum()">🧹 مسح كل رسائل المنتدى</button>
               </div>
+            </div>
+          </div>
+
+          <!-- ESSAY QUEUE -->
+          <div id="tab-essays" class="atab-content">
+            <div class="asec">
+              <h3>✍️ التصحيح المقالي — كل الامتحانات</h3>
+              <p class="admin-help">الحالات: Pending (بانتظار التصحيح) ← Under Review (قيد المراجعة) ← Corrected (تم التصحيح) ← Reviewed (تمت المراجعة).</p>
+              <div id="essayQueueContainer"></div>
+            </div>
+          </div>
+
+          <!-- CERTIFICATES -->
+          <div id="tab-certs" class="atab-content">
+            <div class="asec" id="certAdminRoot">
+              <h3>🎓 شهادات الامتحانات</h3>
+              <p class="admin-help">جاري تحميل التصاميم...</p>
             </div>
           </div>
 
@@ -533,6 +578,9 @@
                 </button>
                 <button class="abtn bg-purple" onclick="examScheduleModal()">
                   ⏰ جدولة فتح/قفل
+                </button>
+                <button class="abtn bg-teal" onclick="examNotifyStudents()">
+                  🔔 إشعار الطلاب بالامتحان
                 </button>
                 <button class="abtn bg-purple" onclick="examEndMsgModal()">
                   💬 رسالة النهاية
@@ -1676,7 +1724,8 @@
         <div id="lockMsg" class="lock-msg">
           ⚠️ لا توجد امتحانات متاحة حالياً
         </div>
-        <input id="nameInput" placeholder="✏️ اسمك الرباعي بالكامل" />
+        <input id="nameInput" placeholder="✏️ اسمك الرباعي بالكامل" autocomplete="name" />
+        <div id="adminNameTag" class="admin-name-tag" hidden></div>
         <input id="phoneInput" type="tel" placeholder="📱 رقم الهاتف" />
         <button class="btn-go" onclick="showWelcome()">🚀 دخول الامتحان</button>
         <div class="divider">أو</div>
@@ -1691,10 +1740,12 @@
           🏆 قائمة الأوائل
         </button>
         <div class="divider">أو</div>
+        <div id="studentCard" class="student-card" hidden></div>
         <div id="resultSection">
           <div class="result-box">
             <h4>🔍 تحقق من نتيجتك بالكود</h4>
-            <input id="codeInput" placeholder="الكود السري" />
+            <select id="codeExamSelect" aria-label="اختر الامتحان"></select>
+            <input id="codeInput" placeholder="الكود السري" inputmode="numeric" />
             <button
               class="btn-go"
               style="margin-top: 6px"
@@ -1705,6 +1756,7 @@
           </div>
         </div>
         <div id="honorSection" style="display: none; margin-top: 16px"></div>
+        <div id="userNotifCard" class="unotif-card" hidden></div>
         <div
           style="
             margin-top: 16px;
@@ -1767,6 +1819,7 @@
           ></p>
           <div id="rMsg" style="margin-bottom: 14px"></div>
           <div id="rTable"></div>
+          <div id="rCert" class="cert-student-wrap"></div>
           <button
             class="abtn bg-dark"
             style="width: 100%; margin-top: 16px"
@@ -1781,13 +1834,20 @@
     <div id="essayGradeModal" class="modal-ov">
       <div class="modal essay-grade-modal">
         <h3 id="essayGradeTitle">تصحيح الأسئلة المقالية</h3>
-        <p class="essay-grade-note">راجع إجابة كل سؤال وحدد الدرجة المستحقة.</p>
+        <div id="essayStatusLine" class="essay-status-line"></div>
+        <p class="essay-grade-note">راجع إجابة كل سؤال وحدد الدرجة المستحقة. اترك الخانة فارغة للسؤال الذي لم يُصحَّح بعد.</p>
         <div id="essayGradeList"></div>
-        <div class="modal-acts">
+        <div class="modal-acts essay-acts">
           <button class="abtn bg-green" style="flex: 1" onclick="saveEssayGrades()">
             حفظ التصحيح وإظهار النتيجة
           </button>
-          <button class="abtn bg-dark" style="flex: 1" onclick="closeModal('essayGradeModal')">
+          <button class="abtn bg-blue" id="essayDraftBtn" style="flex: 1" onclick="saveEssayDraft()">
+            💾 حفظ مسودة
+          </button>
+          <button class="abtn bg-purple" id="essayReviewBtn" style="flex: 1" onclick="markEssayReviewed()" hidden>
+            🛡️ اعتماد المراجعة
+          </button>
+          <button class="abtn bg-dark" style="flex: 1" onclick="cancelEssayGrading()">
             إلغاء
           </button>
         </div>
@@ -2128,5 +2188,7 @@
 
     
     <script type="module" src="./main.js"></script>
+    <script type="module" src="./js/user-notifications.js"></script>
+    <script type="module" src="./js/certificates.js"></script>
   </body>
 </html>
